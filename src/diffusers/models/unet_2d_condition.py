@@ -18,11 +18,13 @@ import torch
 import torch.nn as nn
 import torch.utils.checkpoint
 
+import hetu as ht
+
 from ..configuration_utils import ConfigMixin, register_to_config
 from ..loaders import UNet2DConditionLoadersMixin
 from ..utils import BaseOutput, logging
 from .cross_attention import AttnProcessor
-from .embeddings import TimestepEmbedding, Timesteps
+from .embeddings import TimestepEmbedding, Timesteps, get_timestep_embedding_hetu
 from .modeling_utils import ModelMixin
 from .unet_2d_blocks import (
     CrossAttnDownBlock2D,
@@ -38,6 +40,19 @@ from .unet_2d_blocks import (
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
+def timestepEmbedding_hetu(x, time_embedding: TimestepEmbedding, config):
+    ctx = config.ctx
+    weights = ht.Variable('time_embed_linear1_weights', value=ht.array(time_embedding.linear_1.weight, ctx=ctx))
+    bias = ht.Variable('time_embed_linear1_bias', value=ht.array(time_embedding.linear_1.bias, ctx=ctx))
+    x = ht.linear_op(x, weights, bias, trans_B=True)
+
+    if time_embedding.act is not None:
+        x = ht.silu_op(x)
+
+    weights = ht.Variable('time_embed_linear2_weights', value=ht.array(time_embedding.linear_2.weight, ctx=ctx))
+    bias = ht.Variable('time_embed_linear2_bias', value=ht.array(time_embedding.linear_2.bias, ctx=ctx))
+    x = ht.linear_op(x, weights, bias, trans_B=True)
+    return x
 
 @dataclass
 class UNet2DConditionOutput(BaseOutput):
@@ -139,6 +154,7 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
         # time
         self.time_proj = Timesteps(block_out_channels[0], flip_sin_to_cos, freq_shift)
         timestep_input_dim = block_out_channels[0]
+        self.timestep_input_dim = timestep_input_dim
 
         self.time_embedding = TimestepEmbedding(timestep_input_dim, time_embed_dim)
 
@@ -269,6 +285,119 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
         self.conv_norm_out = nn.GroupNorm(num_channels=block_out_channels[0], num_groups=norm_num_groups, eps=norm_eps)
         self.conv_act = nn.SiLU()
         self.conv_out = nn.Conv2d(block_out_channels[0], out_channels, kernel_size=3, padding=1)
+
+    def build_hetu(self, x, timestep, encoder_hidden_states, attention_mask=None, cross_attention_kwargs=None, config=None):
+
+        ctx = config.ctx
+
+        if self.class_embedding is not None:
+            self.class_embedding = ht.array(self.class_embedding, ctx=ctx)
+
+        default_overall_up_factor = 2**self.num_upsamplers
+
+        # upsample size should be forwarded when sample is not a multiple of `default_overall_up_factor`
+        forward_upsample_size = False
+        upsample_size = None
+
+        if any(s % default_overall_up_factor != 0 for s in [config.height, config.width]):
+            logger.info("Forward upsample size to force interpolation output size.")
+            forward_upsample_size = True
+
+
+        # 0. center input if necessary
+        if self.config.center_input_sample:
+            sample = 2 * sample - 1.0
+
+        # 1. time
+        timesteps = timestep
+
+        # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+        # timesteps = timesteps.expand(sample.shape[0])
+        timesteps = ht.array_reshape_op(timesteps, [1, -1])
+        timesteps = ht.repeat_op(timesteps, [config.batch, 1])
+
+        t_emb = get_timestep_embedding_hetu(timesteps, \
+            self.timestep_input_dim, config=config, downscale_freq_shift=0, flip_sin_to_cos=True)
+
+        # timesteps does not contain any weights and will always return f32 tensors
+        # but time_embedding might actually be running in fp16. so we need to cast here.
+        # there might be better ways to encapsulate this.
+        emb = timestepEmbedding_hetu(t_emb, self.time_embedding, config)
+
+        if self.class_embedding is not None:
+            if class_labels is None:
+                raise ValueError("class_labels should be provided when num_class_embeds > 0")
+
+            if self.config.class_embed_type == "timestep":
+                class_labels = self.time_proj(class_labels)
+
+            class_emb = self.class_embedding(class_labels).to(dtype=self.dtype)
+            emb = emb + class_emb
+
+        # 2. pre-process
+        weights = ht.Variable('conv_in_weights', value=ht.array(self.conv_in.weight, ctx=ctx))
+        bias = ht.Variable('conv_in_bias', value=ht.array(self.conv_in.bias, ctx=ctx))
+        sample = ht.conv2d_add_bias_op(x, weights, bias, padding=1)
+
+        # 3. down
+        down_block_res_samples = (sample,)
+        for downsample_block in self.down_blocks:
+            if hasattr(downsample_block, "has_cross_attention") and downsample_block.has_cross_attention:
+                sample, res_samples = downsample_block.build_hetu(
+                    hidden_states=sample,
+                    temb=emb,
+                    encoder_hidden_states=encoder_hidden_states,
+                    config=config
+                )
+            else:
+                sample, res_samples = downsample_block.build_hetu(hidden_states=sample, temb=emb, config=config)
+
+            down_block_res_samples += res_samples
+
+        # 4. mid
+        sample = self.mid_block.build_hetu(
+            sample,
+            emb,
+            encoder_hidden_states=encoder_hidden_states,
+            config=config
+        )
+
+        # 5. up
+        for i, upsample_block in enumerate(self.up_blocks):
+            is_final_block = i == len(self.up_blocks) - 1
+
+            res_samples = down_block_res_samples[-len(upsample_block.resnets) :]
+            down_block_res_samples = down_block_res_samples[: -len(upsample_block.resnets)]
+
+            # if we have not reached the final block and need to forward the
+            # upsample size, we do it here
+            if not is_final_block and forward_upsample_size:
+                upsample_size = down_block_res_samples[-1].shape[2:]
+
+            if hasattr(upsample_block, "has_cross_attention") and upsample_block.has_cross_attention:
+                sample = upsample_block.build_hetu(
+                    hidden_states=sample,
+                    temb=emb,
+                    res_hidden_states_tuple=res_samples,
+                    encoder_hidden_states=encoder_hidden_states,
+                    upsample_size=upsample_size,
+                    config=config
+                )
+            else:
+                sample = upsample_block.build_hetu(
+                    hidden_states=sample, temb=emb, res_hidden_states_tuple=res_samples, 
+                    upsample_size=upsample_size, config=config
+                )
+
+        # 6. post-process
+        weights = ht.Variable('conv_norm_out_w', value=ht.array(self.conv_norm_out.weight, ctx=ctx))
+        bias = ht.Variable('conv_norm_out_b', value=ht.array(self.conv_norm_out.bias, ctx=ctx))
+        sample = ht.group_normalization_op(sample, weights, bias, self.conv_norm_out.num_groups, eps=self.conv_norm_out.eps)
+        sample = ht.silu_op(sample)
+        weights = ht.Variable('conv_out_w', value=ht.array(self.conv_out.weight, ctx=ctx))
+        bias = ht.Variable('conv_out_b', value=ht.array(self.conv_out.bias, ctx=ctx))
+        sample = ht.conv2d_add_bias_op(sample, weights, bias, padding=1)
+        return sample
 
     @property
     def attn_processors(self) -> Dict[str, AttnProcessor]:

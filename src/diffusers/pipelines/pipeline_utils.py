@@ -259,6 +259,8 @@ class DiffusionPipeline(ConfigMixin):
 
         module_names, _, _ = self.extract_init_dict(dict(self.config))
         for name in module_names.keys():
+            # if name == 'unet':
+            #     continue
             module = getattr(self, name)
             if isinstance(module, torch.nn.Module):
                 if module.dtype == torch.float16 and str(torch_device) in ["cpu"]:
@@ -270,6 +272,7 @@ class DiffusionPipeline(ConfigMixin):
                         " `torch_dtype=torch.float16` argument, or use another device for inference."
                     )
                 module.to(torch_device)
+                self.ctx = module.device
         return self
 
     @property

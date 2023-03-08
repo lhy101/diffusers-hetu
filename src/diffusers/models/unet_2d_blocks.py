@@ -14,6 +14,7 @@
 import numpy as np
 import torch
 from torch import nn
+import hetu as ht
 
 from .attention import AttentionBlock
 from .cross_attention import CrossAttention, CrossAttnAddedKVProcessor
@@ -484,6 +485,18 @@ class UNetMidBlock2DCrossAttn(nn.Module):
         self.attentions = nn.ModuleList(attentions)
         self.resnets = nn.ModuleList(resnets)
 
+    def build_hetu(self, hidden_states, temb=None, encoder_hidden_states=None, config=None):
+        hidden_states = self.resnets[0].build_hetu(hidden_states, temb, config=config)
+        for attn, resnet in zip(self.attentions, self.resnets[1:]):
+            hidden_states = attn.build_hetu(
+                hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                config=config,
+            )
+            hidden_states = resnet.build_hetu(hidden_states, temb, config=config)
+
+        return hidden_states
+
     def forward(
         self, hidden_states, temb=None, encoder_hidden_states=None, attention_mask=None, cross_attention_kwargs=None
     ):
@@ -673,6 +686,7 @@ class AttnDownBlock2D(nn.Module):
 
 
 class CrossAttnDownBlock2D(nn.Module):
+    ID = 0
     def __init__(
         self,
         in_channels: int,
@@ -758,6 +772,27 @@ class CrossAttnDownBlock2D(nn.Module):
             self.downsamplers = None
 
         self.gradient_checkpointing = False
+    
+    def build_hetu(self, hidden_states, temb=None, encoder_hidden_states=None, config=None):
+        name = f'CrossAttnDownBlock2D_{CrossAttnDownBlock2D.ID}_'
+        output_states = ()
+        for resnet, attn in zip(self.resnets, self.attentions):
+            hidden_states = resnet.build_hetu(hidden_states, temb, config=config)
+            hidden_states = attn.build_hetu(hidden_states, encoder_hidden_states, config=config)
+
+            output_states += (hidden_states, )
+        # downsample
+        if self.downsamplers is not None:
+            weights = ht.Variable(name + 'downsample_w', value=ht.array(self.downsamplers[0].conv.weight, ctx=config.ctx))
+            bias = ht.Variable(name + 'downsample_b', value=ht.array(self.downsamplers[0].conv.bias, ctx=config.ctx))
+            hidden_states = ht.conv2d_add_bias_op(hidden_states, weights, bias, padding=1, stride=2)
+            output_states += (hidden_states, )
+
+            config.height = config.height // 2
+            config.width = config.width // 2
+
+        CrossAttnDownBlock2D.ID += 1
+        return hidden_states, output_states
 
     def forward(
         self, hidden_states, temb=None, encoder_hidden_states=None, attention_mask=None, cross_attention_kwargs=None
@@ -804,6 +839,7 @@ class CrossAttnDownBlock2D(nn.Module):
 
 
 class DownBlock2D(nn.Module):
+    ID = 0
     def __init__(
         self,
         in_channels: int,
@@ -854,6 +890,28 @@ class DownBlock2D(nn.Module):
             self.downsamplers = None
 
         self.gradient_checkpointing = False
+    
+    def build_hetu(self, hidden_states, temb=None, encoder_hidden_states=None, config=None):
+        name = f'DownBlock2D_{DownBlock2D.ID}_'
+        output_states = ()
+        for resnet in self.resnets:
+            hidden_states = resnet.build_hetu(hidden_states, temb, config=config)
+
+            output_states += (hidden_states, )
+
+        if self.downsamplers is not None:
+            weights = ht.Variable(name + 'downsample_w',
+                                  value=ht.array(self.downsamplers[0].conv.weight, ctx=config.ctx))
+            bias = ht.Variable(name + 'downsample_b',
+                               value=ht.array(self.downsamplers[0].conv.bias, ctx=config.ctx))
+            hidden_states = ht.conv2d_add_bias_op(hidden_states, weights, bias, padding=1, stride=2)
+            output_states += (hidden_states,)
+
+            config.height = config.height // 2
+            config.width = config.width // 2
+
+        DownBlock2D.ID += 1
+        return hidden_states, output_states
 
     def forward(self, hidden_states, temb=None):
         output_states = ()
@@ -1542,6 +1600,39 @@ class CrossAttnUpBlock2D(nn.Module):
 
         self.gradient_checkpointing = False
 
+    def build_hetu(
+        self,
+        hidden_states,
+        res_hidden_states_tuple,
+        temb=None,
+        encoder_hidden_states=None,
+        cross_attention_kwargs=None,
+        upsample_size=None,
+        attention_mask=None,
+        config=None
+    ):
+        for resnet, attn in zip(self.resnets, self.attentions):
+            # pop res hidden states
+            res_hidden_states = res_hidden_states_tuple[-1]
+            res_hidden_states_tuple = res_hidden_states_tuple[:-1]
+            hidden_states = ht.concat_op(hidden_states, res_hidden_states, axis=1)
+
+            hidden_states = resnet.build_hetu(hidden_states, temb, config=config)
+            hidden_states = attn.build_hetu(
+                hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                config=config
+            )
+
+        if self.upsamplers is not None:
+            for upsampler in self.upsamplers:
+                hidden_states = upsampler.build_hetu(hidden_states, upsample_size, config=config)
+
+                config.height = config.height * 2
+                config.width = config.width * 2
+
+        return hidden_states
+
     def forward(
         self,
         hidden_states,
@@ -1639,6 +1730,25 @@ class UpBlock2D(nn.Module):
             self.upsamplers = None
 
         self.gradient_checkpointing = False
+
+    def build_hetu(self, hidden_states, res_hidden_states_tuple, temb=None, upsample_size=None, config=None):
+        for resnet in self.resnets:
+            # pop res hidden states
+            res_hidden_states = res_hidden_states_tuple[-1]
+            res_hidden_states_tuple = res_hidden_states_tuple[:-1]
+            hidden_states = ht.concat_op(hidden_states, res_hidden_states, axis=1)
+
+            hidden_states = resnet.build_hetu(hidden_states, temb, config=config)
+ 
+
+        if self.upsamplers is not None:
+            for upsampler in self.upsamplers:
+                hidden_states = upsampler.build_hetu(hidden_states, upsample_size, config=config)
+
+                config.height = config.height * 2
+                config.width = config.width * 2
+
+        return hidden_states
 
     def forward(self, hidden_states, res_hidden_states_tuple, temb=None, upsample_size=None):
         for resnet in self.resnets:

@@ -17,6 +17,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 from torch import nn
+import hetu as ht
 
 from ..configuration_utils import ConfigMixin, register_to_config
 from ..models.embeddings import ImagePositionalEmbeddings
@@ -75,7 +76,7 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         attention_bias (`bool`, *optional*):
             Configure if the TransformerBlocks' attention should contain a bias parameter.
     """
-
+    ID = 0
     @register_to_config
     def __init__(
         self,
@@ -104,6 +105,7 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         self.num_attention_heads = num_attention_heads
         self.attention_head_dim = attention_head_dim
         inner_dim = num_attention_heads * attention_head_dim
+        self.inner_dim = inner_dim
 
         # 1. Transformer2DModel can process both standard continous images of shape `(batch_size, num_channels, width, height)` as well as quantized image embeddings of shape `(batch_size, num_image_vectors)`
         # Define whether input is continuous or discrete depending on configuration
@@ -210,6 +212,47 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
             self.norm_out = nn.LayerNorm(inner_dim, elementwise_affine=False, eps=1e-6)
             self.proj_out_1 = nn.Linear(inner_dim, 2 * inner_dim)
             self.proj_out_2 = nn.Linear(inner_dim, patch_size * patch_size * self.out_channels)
+
+    def build_hetu(
+        self,
+        hidden_states,
+        encoder_hidden_states=None,
+        timestep=None,
+        class_labels=None,
+        config=None,
+    ):
+        name = f'Transformer2DModel_{Transformer2DModel.ID}_'
+        ctx = config.ctx
+        residual = hidden_states
+
+        weights = ht.Variable(name + 'norm_weights', value=ht.array(self.norm.weight, ctx=ctx))
+        bias = ht.Variable(name + 'norm_bias', value=ht.array(self.norm.bias, ctx=ctx))
+        hidden_states = ht.group_normalization_op(hidden_states, weights, bias, self.norm.num_groups, eps=self.norm.eps)
+
+        weights = ht.Variable(name + 'proj_in_w', value=ht.array(self.proj_in.weight, ctx=ctx))
+        bias = ht.Variable(name + 'proj_in_b', value=ht.array(self.proj_in.bias, ctx=ctx))
+        hidden_states = ht.conv2d_add_bias_op(hidden_states, weights, bias, stride=1, padding=0)
+
+        hidden_states = ht.transpose_op(hidden_states, (0, 2, 3, 1))
+        hidden_states = ht.array_reshape_op(hidden_states, (config.batch, config.height * config.width, self.inner_dim))
+        for block in self.transformer_blocks:
+            hidden_states = block.build_hetu(
+                hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                timestep=timestep,
+                class_labels=class_labels,
+                config=config
+            )
+        hidden_states = ht.array_reshape_op(hidden_states, (config.batch, config.height, config.width, self.inner_dim))
+        hidden_states = ht.transpose_op(hidden_states, (0, 3, 1, 2))
+        weights = ht.Variable(name + 'proj_out_w', value=ht.array(self.proj_out.weight, ctx=ctx))
+        bias = ht.Variable(name + 'proj_out_b', value=ht.array(self.proj_out.bias, ctx=ctx))
+        hidden_states = ht.conv2d_add_bias_op(hidden_states, weights, bias, stride=1, padding=0)
+
+        hidden_states = ht.add_op(hidden_states, residual)
+        Transformer2DModel.ID += 1
+        return hidden_states
+
 
     def forward(
         self,

@@ -17,6 +17,7 @@ from typing import Callable, Optional
 import torch
 import torch.nn.functional as F
 from torch import nn
+import hetu as ht
 
 from ..utils.import_utils import is_xformers_available
 from .cross_attention import CrossAttention
@@ -190,7 +191,7 @@ class BasicTransformerBlock(nn.Module):
         attention_bias (:
             obj: `bool`, *optional*, defaults to `False`): Configure if the attentions should contain a bias parameter.
     """
-
+    ID = 0
     def __init__(
         self,
         dim: int,
@@ -268,6 +269,57 @@ class BasicTransformerBlock(nn.Module):
         # 3. Feed-forward
         self.norm3 = nn.LayerNorm(dim, elementwise_affine=norm_elementwise_affine)
 
+    def build_hetu(
+        self,
+        hidden_states,
+        encoder_hidden_states=None,
+        timestep=None,
+        attention_mask=None,
+        cross_attention_kwargs=None,
+        class_labels=None,
+        config=None,
+    ):
+        name = f'BasicTransformerBlock_{BasicTransformerBlock.ID}_'
+        weights = ht.Variable(name + 'norm1_weights', value=ht.array(self.norm1.weight, ctx=config.ctx))
+        bias = ht.Variable(name + 'norm1_bias', value=ht.array(self.norm1.bias, ctx=config.ctx))
+        norm_hidden_states = ht.layer_normalization_op(hidden_states, weights, bias, eps=self.norm1.eps)
+        cross_attention_kwargs = cross_attention_kwargs if cross_attention_kwargs is not None else {}
+
+        attn_output = self.attn1.build_hetu(
+            norm_hidden_states,
+            encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
+            attention_mask=attention_mask,
+            config=config,
+            **cross_attention_kwargs,
+        )
+        hidden_states = ht.add_op(attn_output, hidden_states)
+
+        if self.attn2 is not None:
+            weights = ht.Variable(name + 'norm2_weights', value=ht.array(self.norm2.weight, ctx=config.ctx))
+            bias = ht.Variable(name + 'norm2_bias', value=ht.array(self.norm2.bias, ctx=config.ctx))
+            norm_hidden_states = ht.layer_normalization_op(hidden_states, weights, bias, eps=self.norm2.eps)
+
+            # 2. Cross-Attention
+            attn_output = self.attn2.build_hetu(
+                norm_hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                attention_mask=attention_mask,
+                config=config,
+                **cross_attention_kwargs,
+            )
+            hidden_states = ht.add_op(attn_output, hidden_states)
+
+        weights = ht.Variable(name + 'norm3_weights', value=ht.array(self.norm3.weight, ctx=config.ctx))
+        bias = ht.Variable(name + 'norm3_bias', value=ht.array(self.norm3.bias, ctx=config.ctx))
+        norm_hidden_states = ht.layer_normalization_op(hidden_states, weights, bias, eps=self.norm3.eps)
+
+        ff_output = self.ff.build_hetu(norm_hidden_states, config)
+
+        hidden_states = ht.add_op(ff_output, hidden_states)
+
+        BasicTransformerBlock.ID += 1
+        return hidden_states
+
     def forward(
         self,
         hidden_states,
@@ -340,6 +392,7 @@ class FeedForward(nn.Module):
         activation_fn (`str`, *optional*, defaults to `"geglu"`): Activation function to be used in feed-forward.
         final_dropout (`bool` *optional*, defaults to False): Apply a final dropout.
     """
+    ID = 0
 
     def __init__(
         self,
@@ -374,6 +427,16 @@ class FeedForward(nn.Module):
         if final_dropout:
             self.net.append(nn.Dropout(dropout))
 
+    def build_hetu(self, hidden_states, config):
+        name = f'FeedForward_{FeedForward.ID}_'
+        hidden_states = self.net[0].build_hetu(hidden_states, config)
+        weights = ht.Variable(name + 'linear_weights', value=ht.array(self.net[2].weight, ctx=config.ctx))
+        bias = ht.Variable(name + 'linear_bias', value=ht.array(self.net[2].bias, ctx=config.ctx))
+        hidden_states = ht.linear_op(hidden_states, weights, bias, trans_B=True)
+
+        FeedForward.ID += 1
+        return hidden_states
+
     def forward(self, hidden_states):
         for module in self.net:
             hidden_states = module(hidden_states)
@@ -403,6 +466,7 @@ class GELU(nn.Module):
 
 
 class GEGLU(nn.Module):
+    ID = 0
     r"""
     A variant of the gated linear unit activation function from https://arxiv.org/abs/2002.05202.
 
@@ -420,6 +484,21 @@ class GEGLU(nn.Module):
             return F.gelu(gate)
         # mps: gelu is not implemented for float16
         return F.gelu(gate.to(dtype=torch.float32)).to(dtype=gate.dtype)
+
+    def build_hetu(self, hidden_states, config):
+        name = f'GEGLU_{GEGLU.ID}_'
+
+        weights = ht.Variable(name + 'proj_weights', value=ht.array(self.proj.weight, ctx=config.ctx))
+        bias = ht.Variable(name + 'proj_bias', value=ht.array(self.proj.bias, ctx=config.ctx))
+        hidden_states = ht.linear_op(hidden_states, weights, bias, trans_B=True) # (batch, height * width, inner_dim)
+        dim = self.proj.out_features // 2
+        gate = ht.slice_op(hidden_states, (0, 0, dim), (-1, -1, dim))
+        gate = ht.gelu_op(gate)
+        hidden_states = ht.slice_op(hidden_states, (0, 0, 0), (-1, -1, dim))
+        hidden_states = ht.mul_op(hidden_states, gate)
+
+        GEGLU.ID += 1
+        return hidden_states
 
     def forward(self, hidden_states):
         hidden_states, gate = self.proj(hidden_states).chunk(2, dim=-1)

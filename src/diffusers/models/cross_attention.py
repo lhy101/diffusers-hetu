@@ -16,6 +16,7 @@ from typing import Callable, Optional, Union
 import torch
 import torch.nn.functional as F
 from torch import nn
+import hetu as ht
 
 from ..utils import logging
 from ..utils.import_utils import is_xformers_available
@@ -32,6 +33,7 @@ else:
 
 
 class CrossAttention(nn.Module):
+    id = 0
     r"""
     A cross attention layer.
 
@@ -179,6 +181,16 @@ class CrossAttention(nn.Module):
             **cross_attention_kwargs,
         )
 
+    def build_hetu(self, hidden_states, encoder_hidden_states=None, attention_mask=None, config=None, **cross_attention_kwargs):
+        return self.processor.build_hetu(
+            self,
+            hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            attention_mask=attention_mask,
+            config=config,
+            **cross_attention_kwargs,
+        )
+
     def batch_to_head_dim(self, tensor):
         head_size = self.heads
         batch_size, seq_len, dim = tensor.shape
@@ -186,11 +198,26 @@ class CrossAttention(nn.Module):
         tensor = tensor.permute(0, 2, 1, 3).reshape(batch_size // head_size, seq_len, dim * head_size)
         return tensor
 
+    def batch_to_head_dim_hetu(self, tensor, batch_size, seq_len):
+        head_size = self.heads
+        tensor = ht.array_reshape_op(tensor, (batch_size, head_size, seq_len, -1))
+        tensor = ht.transpose_op(tensor, (0, 2, 1, 3))
+        tensor = ht.array_reshape_op(tensor, (batch_size, seq_len, -1))
+        return tensor
+
+
     def head_to_batch_dim(self, tensor):
         head_size = self.heads
         batch_size, seq_len, dim = tensor.shape
         tensor = tensor.reshape(batch_size, seq_len, head_size, dim // head_size)
         tensor = tensor.permute(0, 2, 1, 3).reshape(batch_size * head_size, seq_len, dim // head_size)
+        return tensor
+
+    def head_to_batch_dim_hetu(self, tensor, batch_size, seq_len):
+        head_size = self.heads
+        tensor = ht.array_reshape_op(tensor, (batch_size, seq_len, head_size, -1))
+        tensor = ht.transpose_op(tensor, (0, 2, 1, 3))
+        tensor = ht.array_reshape_op(tensor, (batch_size * head_size, seq_len, -1))
         return tensor
 
     def get_attention_scores(self, query, key, attention_mask=None):
@@ -216,11 +243,34 @@ class CrossAttention(nn.Module):
             alpha=self.scale,
         )
 
+        attention_probs = attention_scores.softmax(dim=-1)
+        attention_probs = attention_probs.to(dtype)
+
+        return attention_probs
+
+    def get_attention_scores_hetu(self, query, key, attention_mask=None, batch=1, len_q=4096, len_kv=77, config=None):
+
+        if attention_mask is None:
+            baddbmm_input = ht.Variable("baddbmm_input", 
+                trainable=False, value=ht.empty((batch * self.heads, len_q, len_kv), ctx=config.ctx))
+            beta = 0
+        else:
+            baddbmm_input = attention_mask
+            beta = 1
+
+        key_trans = ht.transpose_op(key, (0, 2, 1))
+        attention_scores = ht.baddbmm_op(
+            baddbmm_input,
+            query,
+            key_trans,
+            beta=beta,
+            alpha=self.scale,
+        )
+
         if self.upcast_softmax:
             attention_scores = attention_scores.float()
 
-        attention_probs = attention_scores.softmax(dim=-1)
-        attention_probs = attention_probs.to(dtype)
+        attention_probs = ht.softmax_op(attention_scores)
 
         return attention_probs
 
@@ -267,6 +317,44 @@ class CrossAttnProcessor:
         hidden_states = attn.to_out[1](hidden_states)
 
         return hidden_states
+
+    def build_hetu(self, attn: CrossAttention, hidden_states, encoder_hidden_states=None, attention_mask=None, config=None):
+        ctx = config.ctx
+        name = 'cross_attn_' + str(CrossAttention.id) + '_'
+
+        weights = ht.Variable(name + 'to_q_weights', value=ht.array(attn.to_q.weight, ctx=ctx))
+        bias = ht.Variable(name + 'to_q_bias', value=ht.empty((attn.to_q.out_features, ), ctx=ctx))
+        query = ht.linear_op(hidden_states, weights, bias, trans_B=True)
+
+        length_q = config.height * config.width
+        length_kv = config.length if encoder_hidden_states is not None else length_q
+        encoder_hidden_states = encoder_hidden_states if encoder_hidden_states is not None else hidden_states
+
+        weights = ht.Variable(name + 'to_k_weights', value=ht.array(attn.to_k.weight, ctx=ctx))
+        bias = ht.Variable(name + 'to_k_bias', value=ht.empty((attn.to_k.out_features, ), ctx=ctx))
+        key = ht.linear_op(encoder_hidden_states, weights, bias, trans_B=True)
+
+        weights = ht.Variable(name + 'to_v_weights', value=ht.array(attn.to_v.weight, ctx=ctx))
+        bias = ht.Variable(name + 'to_v_bias', value=ht.empty((attn.to_v.out_features, ), ctx=ctx))
+        value = ht.linear_op(encoder_hidden_states, weights, bias, trans_B=True)
+
+        if config.use_fused_multi_head_attention:
+            hidden_states = ht.multi_head_attention_op(query, key, value, attn.heads)
+        else:
+            query = attn.head_to_batch_dim_hetu(query, config.batch, length_q)
+            key = attn.head_to_batch_dim_hetu(key, config.batch, length_kv)
+            value = attn.head_to_batch_dim_hetu(value, config.batch, length_kv)
+            attention_probs = attn.get_attention_scores_hetu(query, key, attention_mask, config.batch, length_q, length_kv, config)
+            hidden_states = ht.batch_matmul_op(attention_probs, value)
+            hidden_states = attn.batch_to_head_dim_hetu(hidden_states, config.batch, length_q)
+
+        # linear proj
+        weights = ht.Variable(name + 'to_out_weights', value=ht.array(attn.to_out[0].weight, ctx=ctx))
+        bias = ht.Variable(name + 'to_out_bias', value=ht.array(attn.to_out[0].bias, ctx=ctx))
+        hidden_states = ht.linear_op(hidden_states, weights, bias, trans_B=True)
+
+        CrossAttention.id += 1
+        return hidden_states       
 
 
 class LoRALinearLayer(nn.Module):

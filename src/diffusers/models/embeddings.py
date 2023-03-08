@@ -16,6 +16,7 @@ import math
 import numpy as np
 import torch
 from torch import nn
+import hetu as ht
 
 
 def get_timestep_embedding(
@@ -60,6 +61,53 @@ def get_timestep_embedding(
         emb = torch.nn.functional.pad(emb, (0, 1, 0, 0))
     return emb
 
+def get_timestep_embedding_hetu(
+    timesteps,
+    embedding_dim: int,
+    flip_sin_to_cos: bool = False,
+    downscale_freq_shift: float = 1,
+    scale: float = 1,
+    max_period: int = 10000,
+    config=None,
+):
+    """
+    This matches the implementation in Denoising Diffusion Probabilistic Models: Create sinusoidal timestep embeddings.
+
+    :param timesteps: a 1-D Tensor of N indices, one per batch element.
+                      These may be fractional.
+    :param embedding_dim: the dimension of the output. :param max_period: controls the minimum frequency of the
+    embeddings. :return: an [N x dim] Tensor of positional embeddings.
+    """
+
+    ctx = timesteps.ctx
+    half_dim = embedding_dim // 2
+    exponent = ht.arange_op(start=0, end=half_dim, ctx=ctx) * -math.log(max_period)
+    exponent = ht.mul_byconst_op(exponent, 1 / (half_dim - downscale_freq_shift))
+
+    emb = ht.exp_op(exponent)
+    # emb = timesteps[:, None].float() * emb[None, :]
+    timesteps = ht.repeat_op(timesteps, [1, half_dim])
+    emb = ht.array_reshape_op(emb, [1, -1])
+    emb = ht.repeat_op(emb, [config.batch, 1])
+    emb = ht.mul_op(timesteps, emb)
+
+    # scale embeddings
+    emb = ht.mul_byconst_op(emb, scale)
+
+    # concat sine and cosine embeddings
+    # emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
+    sin_t, cos_t = ht.sin_op(emb), ht.cos_op(emb)
+
+    # flip sine and cosine embeddings
+    if flip_sin_to_cos:
+        emb = ht.concat_op(cos_t, sin_t, axis=1)
+    else:
+        emb = ht.concat_op(sin_t, cos_t, axis=1)
+
+    # zero pad
+    if embedding_dim % 2 == 1:
+        emb = torch.nn.functional.pad(emb, (0, 1, 0, 0))
+    return emb
 
 def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0):
     """

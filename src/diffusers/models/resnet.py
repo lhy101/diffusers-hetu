@@ -3,6 +3,7 @@ from functools import partial
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import hetu as ht
 
 
 class Upsample1D(nn.Module):
@@ -84,6 +85,7 @@ class Upsample2D(nn.Module):
         use_conv_transpose:
         out_channels:
     """
+    id = 0
 
     def __init__(self, channels, use_conv=False, use_conv_transpose=False, out_channels=None, name="conv"):
         super().__init__()
@@ -104,6 +106,18 @@ class Upsample2D(nn.Module):
             self.conv = conv
         else:
             self.Conv2d_0 = conv
+
+    def build_hetu(self, x, output_size=None, config=None):
+        if output_size is None:
+            x = ht.interpolate_op(x, scale_factor=2.0, mode="nearest")
+        else:
+            x = ht.interpolate_op(x, size=output_size, mode="nearest")
+        weights = ht.Variable('upsampling_conv_w_' + str(Upsample2D.id), value=ht.array(self.conv.weight, ctx=config.ctx))
+        bias = ht.Variable('upsampling_conv_b_' + str(Upsample2D.id), value=ht.array(self.conv.bias, ctx=config.ctx))
+        x = ht.conv2d_add_bias_op(x, weights, bias, padding=1)
+        Upsample2D.id += 1
+        return x
+
 
     def forward(self, hidden_states, output_size=None):
         assert hidden_states.shape[1] == self.channels
@@ -365,6 +379,7 @@ class FirDownsample2D(nn.Module):
 
 
 class ResnetBlock2D(nn.Module):
+    id = 0
     def __init__(
         self,
         *,
@@ -451,6 +466,54 @@ class ResnetBlock2D(nn.Module):
         if self.use_in_shortcut:
             self.conv_shortcut = torch.nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
 
+    def build_hetu(self, input_tensor, temb, config=None):
+        name = f'resnet_{str(ResnetBlock2D.id)}_'
+        ctx = config.ctx
+        hidden_states = input_tensor
+
+        weights = ht.Variable(name + 'norm1_weights', value=ht.array(self.norm1.weight, ctx=ctx))
+        bias = ht.Variable(name + 'norm1_bias', value=ht.array(self.norm1.bias, ctx=ctx))
+        hidden_states = ht.group_normalization_op(hidden_states, weights, bias, self.norm1.num_groups, eps=self.norm1.eps)
+        hidden_states = ht.silu_op(hidden_states)
+
+        weights = ht.Variable(name + 'conv1_w', value=ht.array(self.conv1.weight, ctx=ctx))
+        bias = ht.Variable(name + 'conv1_b', value=ht.array(self.conv1.bias, ctx=ctx))
+        hidden_states = ht.conv2d_add_bias_op(hidden_states, weights, bias, stride=1, padding=1)
+
+        if temb is not None:
+            # temb = self.time_emb_proj(self.nonlinearity(temb))[:, :, None, None]
+            temb = ht.silu_op(temb)
+            weights = ht.Variable(name + 'temb_proj_weights', value=ht.array(self.time_emb_proj.weight, ctx=ctx))
+            bias = ht.Variable(name + 'temb_proj_bias', value=ht.array(self.time_emb_proj.bias, ctx=ctx))
+            temb = ht.linear_op(temb, weights, bias, trans_B=True)
+            temb = ht.array_reshape_op(temb, (config.batch, -1, 1, 1))
+            temb = ht.repeat_op(temb, (1, 1, config.height, config.width))
+
+            if self.time_embedding_norm == "default":
+                hidden_states = ht.add_op(hidden_states, temb)
+            else:
+                assert False
+
+        weights = ht.Variable(name + 'norm2_weights', value=ht.array(self.norm2.weight, ctx=ctx))
+        bias = ht.Variable(name + 'norm2_bias', value=ht.array(self.norm2.bias, ctx=ctx))
+        hidden_states = ht.group_normalization_op(hidden_states, weights, bias, self.norm2.num_groups, eps=self.norm2.eps)
+        hidden_states = ht.silu_op(hidden_states)
+
+        weights = ht.Variable(name + 'conv2_w', value=ht.array(self.conv2.weight, ctx=ctx))
+        bias = ht.Variable(name + 'conv2_b', value=ht.array(self.conv2.bias, ctx=ctx))
+        hidden_states = ht.conv2d_add_bias_op(hidden_states, weights, bias, stride=1, padding=1)
+
+        if self.conv_shortcut is not None:
+            weights = ht.Variable(name + 'conv_shortcut_weights', value=ht.array(self.conv_shortcut.weight, ctx=ctx))
+            bias = ht.Variable(name + 'conv_shortcut_bias', value=ht.array(self.conv_shortcut.bias, ctx=ctx))
+            input_tensor = ht.conv2d_add_bias_op(input_tensor, weights, bias, stride=1, padding=0)
+
+        output_tensor = ht.add_op(input_tensor, hidden_states)
+        output_tensor = ht.mul_byconst_op(output_tensor, 1 / self.output_scale_factor)
+
+        ResnetBlock2D.id += 1
+        return output_tensor
+
     def forward(self, input_tensor, temb):
         hidden_states = input_tensor
 
@@ -484,8 +547,15 @@ class ResnetBlock2D(nn.Module):
 
         hidden_states = self.nonlinearity(hidden_states)
 
-        hidden_states = self.dropout(hidden_states)
+        hidden_states = self.dropout(hidden_states)        
+        if ResnetBlock2D.id == 0:
+            import numpy as np
+            np.save('pytorch.npy', hidden_states.cpu().numpy())
         hidden_states = self.conv2(hidden_states)
+        if ResnetBlock2D.id == 0:
+            import numpy as np
+            np.save('pytorch1.npy', hidden_states.cpu().numpy())
+            ResnetBlock2D.id += 1
 
         if self.conv_shortcut is not None:
             input_tensor = self.conv_shortcut(input_tensor)

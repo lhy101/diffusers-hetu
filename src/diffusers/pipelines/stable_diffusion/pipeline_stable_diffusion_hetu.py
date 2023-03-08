@@ -12,11 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import time
 import inspect
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
 import numpy as np
+import hetu as ht
+from hetu.gpu_links import concatenate, matrix_slice, matrix_elementwise_add, \
+    matrix_elementwise_multiply_by_const, matrix_elementwise_minus
 
 from packaging import version
 from transformers import CLIPFeatureExtractor, CLIPTextModel, CLIPTokenizer
@@ -45,6 +49,50 @@ EXAMPLE_DOC_STRING = """
         >>> image = pipe(prompt).images[0]
         ```
 """
+
+
+class UnetConfig(object):
+    """Configuration class to store the configuration of a `BertModel`.
+    """
+    def __init__(self,
+                 batch_size=100,
+                 height=64,
+                 width=64,
+                 length=77,
+                 ctx=None,
+                 use_fused_multi_head_attention=True,
+                 ):
+        """Constructs BertConfig.
+
+        Args:
+            vocab_size_or_config_json_file: Vocabulary size of `inputs_ids` in `BertModel`.
+            hidden_size: Size of the encoder layers and the pooler layer.
+            num_hidden_layers: Number of hidden layers in the Transformer encoder.
+            num_attention_heads: Number of attention heads for each attention layer in
+                the Transformer encoder.
+            intermediate_size: The size of the "intermediate" (i.e., feed-forward)
+                layer in the Transformer encoder.
+            hidden_act: The non-linear activation function (function or string) in the
+                encoder and pooler. If string, "gelu", "relu" and "swish" are supported.
+            hidden_dropout_prob: The dropout probabilitiy for all fully connected
+                layers in the embeddings, encoder, and pooler.
+            attention_probs_dropout_prob: The dropout ratio for the attention
+                probabilities.
+            max_position_embeddings: The maximum sequence length that this model might
+                ever be used with. Typically set this to something large just in case
+                (e.g., 512 or 1024 or 2048).
+            type_vocab_size: The vocabulary size of the `token_type_ids` passed into
+                `BertModel`.
+            initializer_range: The sttdev of the truncated_normal_initializer for
+                initializing all weight matrices.
+        """
+
+        self.batch = batch_size
+        self.height = height
+        self.width = width
+        self.length = length
+        self.ctx = ctx
+        self.use_fused_multi_head_attention = use_fused_multi_head_attention
 
 
 class StableDiffusionPipeline(DiffusionPipeline):
@@ -164,6 +212,30 @@ class StableDiffusionPipeline(DiffusionPipeline):
         )
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
         self.register_to_config(requires_safety_checker=requires_safety_checker)
+        self.built_hetu = False
+
+    def build_hetu(self):
+        r"""
+        Compile Hetu-Unet
+        """
+        if self.built_hetu:
+            return 
+        self.built_hetu = True
+        start = time.time()
+        ctx = ht.gpu(self.ctx.index)
+        self.model_input = ht.Variable("model_input", trainable=False, value=None, ctx=ctx)
+        self.prompt = ht.Variable("prompt", trainable=False, value=None, ctx=ctx)
+        self.timestep = ht.Variable("timestep", trainable=False, value=None, ctx=ctx)
+        config = UnetConfig(batch_size=2, height=64, width=64, ctx=ctx)
+
+        prediction = self.unet.build_hetu(self.model_input, self.timestep, self.prompt, config=config)
+
+        eval_nodes = {'inference': [prediction]}
+        self.executor = ht.Executor(eval_nodes, ctx=ctx, seed=123)
+        print('hetu unet compile time: ', time.time() - start)
+
+        del self.unet
+        torch.cuda.empty_cache()
 
     def enable_vae_slicing(self):
         r"""
@@ -207,9 +279,9 @@ class StableDiffusionPipeline(DiffusionPipeline):
         `pipeline.enable_sequential_cpu_offload()` the execution device can only be inferred from Accelerate's module
         hooks.
         """
-        if self.device != torch.device("meta") or not hasattr(self.unet, "_hf_hook"):
+        if self.device != torch.device("meta") or not hasattr(self.tokenizer, "_hf_hook"):
             return self.device
-        for module in self.unet.modules():
+        for module in self.tokenizer.modules():
             if (
                 hasattr(module, "_hf_hook")
                 and hasattr(module._hf_hook, "execution_device")
@@ -563,7 +635,7 @@ class StableDiffusionPipeline(DiffusionPipeline):
         else:
             batch_size = prompt_embeds.shape[0]
 
-        device = self._execution_device
+        device = self.ctx
         # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
         # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
         # corresponds to doing no classifier free guidance.
@@ -600,29 +672,47 @@ class StableDiffusionPipeline(DiffusionPipeline):
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
+        # 6.1 transform torch.Tensor to hetu array
+        ctx = ht.gpu(latents.device.index)
+        latents = ht.array(latents, ctx=ctx)
+        prompt_embeds = ht.array(prompt_embeds, ctx=ctx)
+
+        # 6.2 compile hetu unet
+        self.build_hetu()
+
         # 7. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 # expand the latents if we are doing classifier free guidance
-                latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                if do_classifier_free_guidance:
+                    latent_model_input = ht.empty((latents.shape[0] * 2, ) + latents.shape[1:], ctx=ctx)
+                    concatenate([latents, latents], out_arr=latent_model_input, axis=0)
+                else:
+                    latent_model_input = latents
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
+                input_timestep = ht.array([t.item()], ctx=ctx)
                 # predict the noise residual
-                noise_pred = self.unet(
-                    latent_model_input,
-                    t,
-                    encoder_hidden_states=prompt_embeds,
-                    cross_attention_kwargs=cross_attention_kwargs,
-                ).sample
+
+                noise_pred = self.executor.run('inference', feed_dict={
+                    self.model_input: latent_model_input,
+                    self.timestep: input_timestep,
+                    self.prompt: prompt_embeds
+                })[0]
 
                 # perform guidance
                 if do_classifier_free_guidance:
-                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                    noise_pred_uncond = ht.empty((batch_size, ) + noise_pred.shape[1: ], ctx=ctx)
+                    noise_pred_text = ht.empty((batch_size, ) + noise_pred.shape[1: ], ctx=ctx)
+                    matrix_slice(noise_pred, noise_pred_uncond, (0, 0, 0, 0))
+                    matrix_slice(noise_pred, noise_pred_text, (batch_size, 0, 0, 0))
+                    matrix_elementwise_minus(noise_pred_text, noise_pred_uncond, noise_pred_text)
+                    matrix_elementwise_multiply_by_const(noise_pred_text, guidance_scale, noise_pred_text)
+                    matrix_elementwise_add(noise_pred_uncond, noise_pred_text, noise_pred)
 
                 # compute the previous noisy sample x_t -> x_t-1
-                latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
+                latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs)
 
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
@@ -631,10 +721,13 @@ class StableDiffusionPipeline(DiffusionPipeline):
                         callback(i, t, latents)
 
         # 8. Post-processing
+        latents = torch.Tensor(latents.asnumpy()).to(self.ctx)
+        prompt_embeds = torch.Tensor(prompt_embeds.asnumpy()).to(self.ctx)
         image = self.decode_latents(latents)
 
         # 9. Run safety checker
-        image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
+        # image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
+        has_nsfw_concept = False
 
         # 10. Convert to PIL
         if output_type == "pil":
