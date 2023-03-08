@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import time
 import inspect
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -212,30 +211,42 @@ class StableDiffusionPipeline(DiffusionPipeline):
         )
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
         self.register_to_config(requires_safety_checker=requires_safety_checker)
-        self.built_hetu = False
+        self.built_hetu = {}
 
-    def build_hetu(self):
+    def build_hetu(self, batch_size, height, width, prompt):
         r"""
         Compile Hetu-Unet
         """
-        if self.built_hetu:
-            return 
-        self.built_hetu = True
+        if (batch_size, height, width) in self.built_hetu:
+            return self.built_hetu[(batch_size, height, width)]
         start = time.time()
         ctx = ht.gpu(self.ctx.index)
+        config = UnetConfig(batch_size=batch_size, height=height, width=width, ctx=ctx)
+
         self.model_input = ht.Variable("model_input", trainable=False, value=None, ctx=ctx)
         self.prompt = ht.Variable("prompt", trainable=False, value=None, ctx=ctx)
         self.timestep = ht.Variable("timestep", trainable=False, value=None, ctx=ctx)
-        config = UnetConfig(batch_size=2, height=64, width=64, ctx=ctx)
-
         prediction = self.unet.build_hetu(self.model_input, self.timestep, self.prompt, config=config)
-
         eval_nodes = {'inference': [prediction]}
-        self.executor = ht.Executor(eval_nodes, ctx=ctx, seed=123)
+        executor = ht.Executor(eval_nodes, ctx=ctx, seed=123)
+
+        # warmup executor
+        executor.run('inference', feed_dict={
+            self.model_input: ht.array(
+                np.random.randn(batch_size, self.unet.in_channels, height, width), ctx=ctx),
+            self.timestep: ht.array([0], ctx=ctx),
+            self.prompt: prompt
+        })[0]
         print('hetu unet compile time: ', time.time() - start)
 
+        # cache hetu graph
+        self.built_hetu[(batch_size, height, width)] = executor
+
+        # clear pytorch unet
         del self.unet
         torch.cuda.empty_cache()
+
+        return executor
 
     def enable_vae_slicing(self):
         r"""
@@ -676,9 +687,16 @@ class StableDiffusionPipeline(DiffusionPipeline):
         ctx = ht.gpu(latents.device.index)
         latents = ht.array(latents, ctx=ctx)
         prompt_embeds = ht.array(prompt_embeds, ctx=ctx)
+        latent_model_input = ht.empty((latents.shape[0] * 2, ) + latents.shape[1:], ctx=ctx)
+
+        if do_classifier_free_guidance:
+            noise_pred_uncond = ht.empty((batch_size, ) + latents.shape[1: ], ctx=ctx)
+            noise_pred_text = ht.empty((batch_size, ) + latents.shape[1: ], ctx=ctx)
 
         # 6.2 compile hetu unet
-        self.build_hetu()
+        executor = self.build_hetu(batch_size * 2 if do_classifier_free_guidance else batch_size,
+                        latents.shape[2], latents.shape[3], prompt_embeds)
+        stream = executor.config.comp_stream
 
         # 7. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
@@ -686,8 +704,7 @@ class StableDiffusionPipeline(DiffusionPipeline):
             for i, t in enumerate(timesteps):
                 # expand the latents if we are doing classifier free guidance
                 if do_classifier_free_guidance:
-                    latent_model_input = ht.empty((latents.shape[0] * 2, ) + latents.shape[1:], ctx=ctx)
-                    concatenate([latents, latents], out_arr=latent_model_input, axis=0)
+                    concatenate([latents, latents], out_arr=latent_model_input, axis=0, stream=stream)
                 else:
                     latent_model_input = latents
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
@@ -695,7 +712,7 @@ class StableDiffusionPipeline(DiffusionPipeline):
                 input_timestep = ht.array([t.item()], ctx=ctx)
                 # predict the noise residual
 
-                noise_pred = self.executor.run('inference', feed_dict={
+                noise_pred = executor.run('inference', feed_dict={
                     self.model_input: latent_model_input,
                     self.timestep: input_timestep,
                     self.prompt: prompt_embeds
@@ -703,16 +720,14 @@ class StableDiffusionPipeline(DiffusionPipeline):
 
                 # perform guidance
                 if do_classifier_free_guidance:
-                    noise_pred_uncond = ht.empty((batch_size, ) + noise_pred.shape[1: ], ctx=ctx)
-                    noise_pred_text = ht.empty((batch_size, ) + noise_pred.shape[1: ], ctx=ctx)
-                    matrix_slice(noise_pred, noise_pred_uncond, (0, 0, 0, 0))
-                    matrix_slice(noise_pred, noise_pred_text, (batch_size, 0, 0, 0))
-                    matrix_elementwise_minus(noise_pred_text, noise_pred_uncond, noise_pred_text)
-                    matrix_elementwise_multiply_by_const(noise_pred_text, guidance_scale, noise_pred_text)
-                    matrix_elementwise_add(noise_pred_uncond, noise_pred_text, noise_pred)
+                    matrix_slice(noise_pred, noise_pred_uncond, (0, 0, 0, 0), stream=stream)
+                    matrix_slice(noise_pred, noise_pred_text, (batch_size, 0, 0, 0), stream=stream)
+                    matrix_elementwise_minus(noise_pred_text, noise_pred_uncond, noise_pred_text, stream=stream)
+                    matrix_elementwise_multiply_by_const(noise_pred_text, guidance_scale, noise_pred_text, stream=stream)
+                    matrix_elementwise_add(noise_pred_uncond, noise_pred_text, noise_pred, stream=stream)
 
                 # compute the previous noisy sample x_t -> x_t-1
-                latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs)
+                latents = self.scheduler.step(noise_pred, t, latents, stream, **extra_step_kwargs)
 
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):

@@ -199,6 +199,7 @@ class PNDMScheduler(SchedulerMixin, ConfigMixin):
         model_output,
         timestep: int,
         sample,
+        stream,
     ) -> Union[SchedulerOutput, Tuple]:
         """
         Predict the sample at the previous timestep by reversing the SDE. Core function to propagate the diffusion
@@ -221,9 +222,9 @@ class PNDMScheduler(SchedulerMixin, ConfigMixin):
         """
 
         if self.counter < len(self.prk_timesteps) and not self.config.skip_prk_steps:
-            ret = self.step_prk(model_output=model_output, timestep=timestep, sample=sample)
+            ret = self.step_prk(model_output=model_output, timestep=timestep, sample=sample, stream=stream)
         else:
-            ret = self.step_plms(model_output=model_output, timestep=timestep, sample=sample)
+            ret = self.step_plms(model_output=model_output, timestep=timestep, sample=sample, stream=stream)
 
         return ret
 
@@ -232,6 +233,7 @@ class PNDMScheduler(SchedulerMixin, ConfigMixin):
         model_output,
         timestep: int,
         sample,
+        stream,
     ):
         """
         Step function propagating the sample with the Runge-Kutta method. RK takes 4 forward passes to approximate the
@@ -277,7 +279,7 @@ class PNDMScheduler(SchedulerMixin, ConfigMixin):
         # cur_sample should not be `None`
         cur_sample = self.cur_sample if self.cur_sample is not None else sample
 
-        prev_sample = self._get_prev_sample(cur_sample, timestep, prev_timestep, model_output)
+        prev_sample = self._get_prev_sample(cur_sample, timestep, prev_timestep, model_output, stream)
         self.counter += 1
 
         return prev_sample
@@ -287,6 +289,7 @@ class PNDMScheduler(SchedulerMixin, ConfigMixin):
         model_output,
         timestep: int,
         sample,
+        stream,
     ):
         """
         Step function propagating the sample with the linear multi-step method. This has one forward pass with multiple
@@ -322,7 +325,7 @@ class PNDMScheduler(SchedulerMixin, ConfigMixin):
         if self.counter != 1:
             self.ets = self.ets[-3:]
             model_output_t = ht.empty(model_output.shape, ctx=model_output.ctx)
-            clone(model_output, model_output_t)
+            clone(model_output, model_output_t, stream=stream)
             self.ets.append(model_output_t)
         else:
             prev_timestep = timestep
@@ -331,39 +334,37 @@ class PNDMScheduler(SchedulerMixin, ConfigMixin):
         if len(self.ets) == 1 and self.counter == 0:
             model_output = model_output
             self.cur_sample = sample
+            self.buffer = ht.empty(model_output.shape, ctx=model_output.ctx)
         elif len(self.ets) == 1 and self.counter == 1:
-            matrix_elementwise_add(model_output, self.ets[-1], model_output)
-            matrix_elementwise_multiply_by_const(model_output, 0.5, model_output)
+            matrix_elementwise_add(model_output, self.ets[-1], model_output, stream=stream)
+            matrix_elementwise_multiply_by_const(model_output, 0.5, model_output, stream=stream)
             sample = self.cur_sample
             self.cur_sample = None
         elif len(self.ets) == 2:
             # model_output = (3 * self.ets[-1] - self.ets[-2]) / 2
-            tmp = ht.empty(model_output.shape, ctx=model_output.ctx)
-            matrix_elementwise_multiply_by_const(self.ets[-1], 3, model_output)
-            matrix_elementwise_minus(model_output, self.ets[-2], model_output)
-            matrix_elementwise_multiply_by_const(model_output, 0.5, model_output)
+            matrix_elementwise_multiply_by_const(self.ets[-1], 3, model_output, stream=stream)
+            matrix_elementwise_minus(model_output, self.ets[-2], model_output, stream=stream)
+            matrix_elementwise_multiply_by_const(model_output, 0.5, model_output, stream=stream)
         elif len(self.ets) == 3:      
             # model_output = (23 * self.ets[-1] - 16 * self.ets[-2] + 5 * self.ets[-3]) / 12
-            tmp = ht.empty(model_output.shape, ctx=model_output.ctx)
-            matrix_elementwise_multiply_by_const(self.ets[-1], 23, model_output)
-            matrix_elementwise_multiply_by_const(self.ets[-2], 16, tmp)
-            matrix_elementwise_minus(model_output, tmp, model_output)
-            matrix_elementwise_multiply_by_const(self.ets[-3], 5, tmp)
-            matrix_elementwise_add(model_output, tmp, model_output)
-            matrix_elementwise_multiply_by_const(model_output, 1 / 12, model_output)
+            matrix_elementwise_multiply_by_const(self.ets[-1], 23, model_output, stream=stream)
+            matrix_elementwise_multiply_by_const(self.ets[-2], 16, self.buffer, stream=stream)
+            matrix_elementwise_minus(model_output, self.buffer, model_output, stream=stream)
+            matrix_elementwise_multiply_by_const(self.ets[-3], 5, self.buffer, stream=stream)
+            matrix_elementwise_add(model_output, self.buffer, model_output, stream=stream)
+            matrix_elementwise_multiply_by_const(model_output, 1 / 12, model_output, stream=stream)
         else:
             # model_output = (1 / 24) * (55 * self.ets[-1] - 59 * self.ets[-2] + 37 * self.ets[-3] - 9 * self.ets[-4])
-            tmp = ht.empty(model_output.shape, ctx=model_output.ctx)
-            matrix_elementwise_multiply_by_const(self.ets[-1], 55, model_output)
-            matrix_elementwise_multiply_by_const(self.ets[-2], 59, tmp)
-            matrix_elementwise_minus(model_output, tmp, model_output)
-            matrix_elementwise_multiply_by_const(self.ets[-3], 37, tmp)
-            matrix_elementwise_add(model_output, tmp, model_output)
-            matrix_elementwise_multiply_by_const(self.ets[-4], 9, tmp)
-            matrix_elementwise_minus(model_output, tmp, model_output)
-            matrix_elementwise_multiply_by_const(model_output, 1 / 24, model_output)
+            matrix_elementwise_multiply_by_const(self.ets[-1], 55, model_output, stream=stream)
+            matrix_elementwise_multiply_by_const(self.ets[-2], 59, self.buffer, stream=stream)
+            matrix_elementwise_minus(model_output, self.buffer, model_output, stream=stream)
+            matrix_elementwise_multiply_by_const(self.ets[-3], 37, self.buffer, stream=stream)
+            matrix_elementwise_add(model_output, self.buffer, model_output, stream=stream)
+            matrix_elementwise_multiply_by_const(self.ets[-4], 9, self.buffer, stream=stream)
+            matrix_elementwise_minus(model_output, self.buffer, model_output, stream=stream)
+            matrix_elementwise_multiply_by_const(model_output, 1 / 24, model_output, stream=stream)
 
-        prev_sample = self._get_prev_sample(sample, timestep, prev_timestep, model_output)
+        prev_sample = self._get_prev_sample(sample, timestep, prev_timestep, model_output, stream)
         self.counter += 1
 
         return prev_sample
@@ -381,7 +382,7 @@ class PNDMScheduler(SchedulerMixin, ConfigMixin):
         """
         return sample
 
-    def _get_prev_sample(self, sample, timestep, prev_timestep, model_output):
+    def _get_prev_sample(self, sample, timestep, prev_timestep, model_output, stream):
         # See formula (9) of PNDM paper https://arxiv.org/pdf/2202.09778.pdf
         # this function computes x_(t−δ) using the formula of (9)
         # Note that x_t needs to be added to both sides of the equation
@@ -428,9 +429,10 @@ class PNDMScheduler(SchedulerMixin, ConfigMixin):
         # prev_sample = (
         #     sample_coeff * sample - (alpha_prod_t_prev - alpha_prod_t) * model_output / model_output_denom_coeff
         # )
-        matrix_elementwise_multiply_by_const(sample, sample_coeff, sample_t)
-        matrix_elementwise_multiply_by_const(model_output, (alpha_prod_t_prev - alpha_prod_t) / model_output_denom_coeff, model_output_t)
-        matrix_elementwise_minus(sample_t, model_output_t, prev_sample)
+        matrix_elementwise_multiply_by_const(sample, sample_coeff, sample_t, stream=stream)
+        matrix_elementwise_multiply_by_const(model_output, 
+            (alpha_prod_t_prev - alpha_prod_t) / model_output_denom_coeff, model_output_t, stream=stream)
+        matrix_elementwise_minus(sample_t, model_output_t, prev_sample, stream=stream)
 
         return prev_sample
 
