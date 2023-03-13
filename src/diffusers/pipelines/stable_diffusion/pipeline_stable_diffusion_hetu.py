@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import time
 import inspect
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -50,7 +51,7 @@ EXAMPLE_DOC_STRING = """
 """
 
 
-class UnetConfig(object):
+class HetuUnetConfig(object):
     """Configuration class to store the configuration of a `BertModel`.
     """
     def __init__(self,
@@ -221,7 +222,7 @@ class StableDiffusionPipeline(DiffusionPipeline):
             return self.built_hetu[(batch_size, height, width)]
         start = time.time()
         ctx = ht.gpu(self.ctx.index)
-        config = UnetConfig(batch_size=batch_size, height=height, width=width, ctx=ctx)
+        config = HetuUnetConfig(batch_size=batch_size, height=height, width=width, ctx=ctx)
 
         self.model_input = ht.Variable("model_input", trainable=False, value=None, ctx=ctx)
         self.prompt = ht.Variable("prompt", trainable=False, value=None, ctx=ctx)
@@ -708,10 +709,9 @@ class StableDiffusionPipeline(DiffusionPipeline):
                 else:
                     latent_model_input = latents
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
-
                 input_timestep = ht.array([t.item()], ctx=ctx)
-                # predict the noise residual
 
+                # predict the noise residual
                 noise_pred = executor.run('inference', feed_dict={
                     self.model_input: latent_model_input,
                     self.timestep: input_timestep,
@@ -724,10 +724,11 @@ class StableDiffusionPipeline(DiffusionPipeline):
                     matrix_slice(noise_pred, noise_pred_text, (batch_size, 0, 0, 0), stream=stream)
                     matrix_elementwise_minus(noise_pred_text, noise_pred_uncond, noise_pred_text, stream=stream)
                     matrix_elementwise_multiply_by_const(noise_pred_text, guidance_scale, noise_pred_text, stream=stream)
-                    matrix_elementwise_add(noise_pred_uncond, noise_pred_text, noise_pred, stream=stream)
+                    matrix_elementwise_add(noise_pred_uncond, noise_pred_text, noise_pred_uncond, stream=stream)
+                    noise_pred = noise_pred_uncond
 
                 # compute the previous noisy sample x_t -> x_t-1
-                latents = self.scheduler.step(noise_pred, t, latents, stream, **extra_step_kwargs)
+                latents = self.scheduler.step(noise_pred, t, latents, stream=stream, **extra_step_kwargs)
 
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):

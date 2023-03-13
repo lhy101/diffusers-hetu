@@ -548,14 +548,7 @@ class ResnetBlock2D(nn.Module):
         hidden_states = self.nonlinearity(hidden_states)
 
         hidden_states = self.dropout(hidden_states)        
-        if ResnetBlock2D.id == 0:
-            import numpy as np
-            np.save('pytorch.npy', hidden_states.cpu().numpy())
         hidden_states = self.conv2(hidden_states)
-        if ResnetBlock2D.id == 0:
-            import numpy as np
-            np.save('pytorch1.npy', hidden_states.cpu().numpy())
-            ResnetBlock2D.id += 1
 
         if self.conv_shortcut is not None:
             input_tensor = self.conv_shortcut(input_tensor)

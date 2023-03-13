@@ -22,7 +22,7 @@ try:
 except OptionalDependencyNotAvailable:
     from ..utils.dummy_pt_objects import *  # noqa F403
 else:
-    from .scheduling_ddim import DDIMScheduler
+    from .scheduling_ddim_hetu import DDIMScheduler
     from .scheduling_ddpm import DDPMScheduler
     from .scheduling_deis_multistep import DEISMultistepScheduler
     from .scheduling_dpmsolver_multistep import DPMSolverMultistepScheduler
