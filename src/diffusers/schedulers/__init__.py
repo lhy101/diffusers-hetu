@@ -25,7 +25,7 @@ else:
     from .scheduling_ddim_hetu import DDIMScheduler
     from .scheduling_ddpm import DDPMScheduler
     from .scheduling_deis_multistep import DEISMultistepScheduler
-    from .scheduling_dpmsolver_multistep import DPMSolverMultistepScheduler
+    from .scheduling_dpmsolver_multistep_hetu import DPMSolverMultistepScheduler
     from .scheduling_dpmsolver_singlestep import DPMSolverSinglestepScheduler
     from .scheduling_euler_ancestral_discrete import EulerAncestralDiscreteScheduler
     from .scheduling_euler_discrete import EulerDiscreteScheduler
