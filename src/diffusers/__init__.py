@@ -116,6 +116,7 @@ else:
         StableDiffusionInpaintPipelineLegacy,
         StableDiffusionInstructPix2PixPipeline,
         StableDiffusionPipeline,
+        StableDiffusionPipelineEdit,
         StableDiffusionPipelineSafe,
         StableDiffusionUpscalePipeline,
         UnCLIPImageVariationPipeline,
