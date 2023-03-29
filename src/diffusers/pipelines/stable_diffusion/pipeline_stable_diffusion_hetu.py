@@ -693,6 +693,7 @@ class StableDiffusionPipeline(DiffusionPipeline):
         if do_classifier_free_guidance:
             noise_pred_uncond = ht.empty((batch_size, ) + latents.shape[1: ], ctx=ctx)
             noise_pred_text = ht.empty((batch_size, ) + latents.shape[1: ], ctx=ctx)
+        self.scheduler.build_hetu(latents.shape, ctx)
 
         # 6.2 compile hetu unet
         executor = self.build_hetu(batch_size * 2 if do_classifier_free_guidance else batch_size,

@@ -23,7 +23,7 @@ import numpy as np
 import cv2 as cv
 import hetu as ht
 from hetu.gpu_links import concatenate, matrix_slice, matrix_elementwise_add, \
-    matrix_elementwise_multiply_by_const, matrix_elementwise_minus
+    matrix_elementwise_multiply_by_const, matrix_elementwise_minus, array_set
 
 from packaging import version
 from transformers import CLIPFeatureExtractor, CLIPTextModel, CLIPTokenizer
@@ -227,6 +227,7 @@ class StableDiffusionPipelineEdit(DiffusionPipeline):
         Compile Hetu-Unet
         """
         if (batch_size, height, width) in self.built_hetu:
+            torch.cuda.empty_cache()
             return self.built_hetu[(batch_size, height, width)]
         start = time.time()
         ctx = ht.gpu(self.ctx.index)
@@ -235,8 +236,8 @@ class StableDiffusionPipelineEdit(DiffusionPipeline):
         self.model_input = ht.Variable("model_input", trainable=False, value=None, ctx=ctx)
         self.prompt = ht.Variable("prompt", trainable=False, value=None, ctx=ctx)
         self.timestep = ht.Variable("timestep", trainable=False, value=None, ctx=ctx)
-        prediction = self.unet.build_hetu(self.model_input, self.timestep, self.prompt, config=config)
-        eval_nodes = {'inference': [prediction]}
+        self.prediction = self.unet.build_hetu(self.model_input, self.timestep, self.prompt, config=config)
+        eval_nodes = {'inference': [self.prediction]}
         executor = ht.Executor(eval_nodes, ctx=ctx, seed=123)
 
         # warmup executor
@@ -697,11 +698,13 @@ class StableDiffusionPipelineEdit(DiffusionPipeline):
         ctx = ht.gpu(latents.device.index)
         latents = ht.array(latents, ctx=ctx)
         prompt_embeds = ht.array(prompt_embeds, ctx=ctx)
+        input_timestep = ht.empty((1, ), ctx=ctx)
         latent_model_input = ht.empty((latents.shape[0] * 2, ) + latents.shape[1:], ctx=ctx)
 
         if do_classifier_free_guidance:
             noise_pred_uncond = ht.empty((batch_size, ) + latents.shape[1: ], ctx=ctx)
             noise_pred_text = ht.empty((batch_size, ) + latents.shape[1: ], ctx=ctx)
+        self.scheduler.build_hetu(latents.shape, ctx)
 
         # 6.2 compile hetu unet
         if save_checkpoint:
@@ -725,7 +728,7 @@ class StableDiffusionPipelineEdit(DiffusionPipeline):
                 else:
                     latent_model_input = latents
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
-                input_timestep = ht.array([t.item()], ctx=ctx)
+                array_set(input_timestep, t.item(), stream=stream)
 
                 # predict the noise residual
                 noise_pred = executor.run('inference', feed_dict={
@@ -733,9 +736,6 @@ class StableDiffusionPipelineEdit(DiffusionPipeline):
                     self.timestep: input_timestep,
                     self.prompt: prompt_embeds
                 })[0]
-
-                if not save_checkpoint and i >= 9 and i < num_inference_steps - 1:
-                    executor.load_cache(i + 1)
 
                 # perform guidance
                 if do_classifier_free_guidance:
@@ -748,13 +748,12 @@ class StableDiffusionPipelineEdit(DiffusionPipeline):
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents, stream=stream, **extra_step_kwargs)
-
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
                     if callback is not None and i % callback_steps == 0:
                         callback(i, t, latents)
-                
+
                 if save_checkpoint:
                     np.save(f'checkpoints/{i+1}.npy', latents.asnumpy())
                 elif i <= 9:
@@ -800,6 +799,9 @@ class StableDiffusionPipelineEdit(DiffusionPipeline):
         # 10. Convert to PIL
         if output_type == "pil":
             image = self.numpy_to_pil(image)
+
+        if save_checkpoint:
+            executor.config.d2h_stream.sync()
 
         if not return_dict:
             return (image, has_nsfw_concept)

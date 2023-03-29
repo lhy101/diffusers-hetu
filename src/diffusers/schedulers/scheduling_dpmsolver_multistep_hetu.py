@@ -182,6 +182,7 @@ class DPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
         self.timesteps = torch.from_numpy(timesteps)
         self.model_outputs = [None] * solver_order
         self.lower_order_nums = 0
+        self.built = False
 
     def set_timesteps(self, num_inference_steps: int, device: Union[str, torch.device] = None):
         """
@@ -194,20 +195,32 @@ class DPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
                 the device to which the timesteps should be moved to. If `None`, the timesteps are not moved.
         """
         self.num_inference_steps = num_inference_steps
-        timesteps = (
+        self.timesteps = (
             np.linspace(0, self.num_train_timesteps - 1, num_inference_steps + 1)
             .round()[::-1][:-1]
             .copy()
             .astype(np.int64)
         )
-        self.timesteps = torch.from_numpy(timesteps).to(device)
         self.model_outputs = [
             None,
         ] * self.config.solver_order
         self.lower_order_nums = 0
+    
+    def build_hetu(self, shape, ctx):
+        if self.built:
+            return 
+        self.built = True
+        self.x_t = ht.empty(shape, ctx=ctx)
+        self.model_t = ht.empty(shape, ctx=ctx)
+        self.sample_t = ht.empty(shape, ctx=ctx)
+        self.D1_0 = ht.empty(shape, ctx=ctx)
+        self.D1_1 = ht.empty(shape, ctx=ctx)
+        self.D1 = ht.empty(shape, ctx=ctx)
+        self.D2 = ht.empty(shape, ctx=ctx)
+        self.ret = ht.empty(shape, ctx=ctx)
 
     def convert_model_output(
-        self, model_output: torch.FloatTensor, timestep: int, sample: torch.FloatTensor
+        self, model_output: torch.FloatTensor, timestep: int, sample: torch.FloatTensor, stream
     ) -> torch.FloatTensor:
         """
         Convert the model output to the corresponding type that the algorithm (DPM-Solver / DPM-Solver++) needs.
@@ -229,22 +242,21 @@ class DPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
             `torch.FloatTensor`: the converted model output.
         """
         # DPM-Solver++ needs to solve an integral of the data prediction model.
-        ret = ht.empty(sample.shape, ctx=sample.ctx)
         if self.config.algorithm_type == "dpmsolver++":
             if self.config.prediction_type == "epsilon":
                 alpha_t, sigma_t = self.alpha_t[timestep], self.sigma_t[timestep]
                 # x0_pred = (sample - sigma_t * model_output) / alpha_t
-                matrix_elementwise_multiply_by_const(model_output, sigma_t, ret)
-                matrix_elementwise_minus(sample, ret, ret)
-                matrix_elementwise_multiply_by_const(model_output, 1.0 / alpha_t, ret)
+                matrix_elementwise_multiply_by_const(model_output, sigma_t, self.ret, stream=stream)
+                matrix_elementwise_minus(sample, self.ret, self.ret, stream=stream)
+                matrix_elementwise_multiply_by_const(model_output, 1.0 / alpha_t, self.ret, stream=stream)
             elif self.config.prediction_type == "sample":
-                ret = model_output
+                self.ret = model_output
             elif self.config.prediction_type == "v_prediction":
                 alpha_t, sigma_t = self.alpha_t[timestep], self.sigma_t[timestep]
                 # x0_pred = alpha_t * sample - sigma_t * model_output
-                matrix_elementwise_multiply_by_const(sample, alpha_t, ret)
-                matrix_elementwise_multiply_by_const(model_output, sigma_t, model_output)
-                matrix_elementwise_minus(ret, model_output, ret)
+                matrix_elementwise_multiply_by_const(sample, alpha_t, self.ret, stream=stream)
+                matrix_elementwise_multiply_by_const(model_output, sigma_t, model_output, stream=stream)
+                matrix_elementwise_minus(self.ret, model_output, self.ret, stream=stream)
             else:
                 raise ValueError(
                     f"prediction_type given as {self.config.prediction_type} must be one of `epsilon`, `sample`, or"
@@ -265,7 +277,7 @@ class DPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
                 )[(...,) + (None,) * (x0_pred.ndim - 1)]
                 x0_pred = torch.clamp(x0_pred, -dynamic_max_val, dynamic_max_val) / dynamic_max_val
                 x0_pred = x0_pred.type(orig_dtype)
-            return ret
+            return self.ret
         # DPM-Solver needs to solve an integral of the noise prediction model.
         elif self.config.algorithm_type == "dpmsolver":
             if self.config.prediction_type == "epsilon":
@@ -286,10 +298,11 @@ class DPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
 
     def dpm_solver_first_order_update(
         self,
-        model_output: torch.FloatTensor,
+        model_output,
         timestep: int,
         prev_timestep: int,
-        sample: torch.FloatTensor,
+        sample,
+        stream,
     ) -> torch.FloatTensor:
         """
         One step for the first-order DPM-Solver (equivalent to DDIM).
@@ -310,26 +323,25 @@ class DPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
         alpha_t, alpha_s = self.alpha_t[prev_timestep], self.alpha_t[timestep]
         sigma_t, sigma_s = self.sigma_t[prev_timestep], self.sigma_t[timestep]
         h = lambda_t - lambda_s
-        x_t = ht.empty(sample.shape, ctx=sample.ctx)
-        model_output_t = ht.empty(sample.shape, ctx=sample.ctx)
         if self.config.algorithm_type == "dpmsolver++":
             # x_t = (sigma_t / sigma_s) * sample - (alpha_t * (torch.exp(-h) - 1.0)) * model_output
-            matrix_elementwise_multiply_by_const(sample, (sigma_t / sigma_s), x_t)
-            matrix_elementwise_multiply_by_const(model_output, (alpha_t * (math.exp(-h) - 1.0)), model_output_t)
-            matrix_elementwise_minus(x_t, model_output_t, x_t)
+            matrix_elementwise_multiply_by_const(sample, (sigma_t / sigma_s), self.x_t, stream=stream)
+            matrix_elementwise_multiply_by_const(model_output, (alpha_t * (math.exp(-h) - 1.0)), self.model_t, stream=stream)
+            matrix_elementwise_minus(self.x_t, self.model_t, self.x_t, stream=stream)
         elif self.config.algorithm_type == "dpmsolver":
             # x_t = (alpha_t / alpha_s) * sample - (sigma_t * (torch.exp(h) - 1.0)) * model_output
-            matrix_elementwise_multiply_by_const(sample, (alpha_t / alpha_s), x_t)
-            matrix_elementwise_multiply_by_const(model_output, (sigma_t * (math.exp(h) - 1.0)), model_output_t)
-            matrix_elementwise_minus(x_t, model_output_t, x_t)
-        return x_t
+            matrix_elementwise_multiply_by_const(sample, (alpha_t / alpha_s), self.x_t, stream=stream)
+            matrix_elementwise_multiply_by_const(model_output, (sigma_t * (math.exp(h) - 1.0)), self.model_t, stream=stream)
+            matrix_elementwise_minus(self.x_t, self.model_t, self.x_t, stream=stream)
+        return self.x_t
 
     def multistep_dpm_solver_second_order_update(
         self,
-        model_output_list: List[torch.FloatTensor],
+        model_output_list,
         timestep_list: List[int],
         prev_timestep: int,
-        sample: torch.FloatTensor,
+        sample,
+        stream
     ) -> torch.FloatTensor:
         """
         One step for the second-order multistep DPM-Solver.
@@ -354,12 +366,8 @@ class DPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
         r0 = h_0 / h
         # D0, D1 = m0, (1.0 / r0) * (m0 - m1)
         D0 = m0
-        D1 = ht.empty(m0.shape, ctx=m0.ctx)
-        x_t = ht.empty(m0.shape, ctx=m0.ctx)
-        model_t = ht.empty(m0.shape, ctx=m0.ctx)
-        sample_t = ht.empty(m0.shape, ctx=m0.ctx)
-        matrix_elementwise_minus(m0, m1, D1)
-        matrix_elementwise_multiply_by_const(D1, 1.0 / r0, D1)
+        matrix_elementwise_minus(m0, m1, self.D1, stream=stream)
+        matrix_elementwise_multiply_by_const(self.D1, 1.0 / r0, self.D1, stream=stream)
         if self.config.algorithm_type == "dpmsolver++":
             # See https://arxiv.org/abs/2211.01095 for detailed derivations
             if self.config.solver_type == "midpoint":
@@ -368,22 +376,22 @@ class DPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
                 #     - (alpha_t * (torch.exp(-h) - 1.0)) * D0
                 #     - 0.5 * (alpha_t * (torch.exp(-h) - 1.0)) * D1
                 # )
-                matrix_elementwise_multiply_by_const(sample, (sigma_t / sigma_s0), sample_t)
-                matrix_elementwise_multiply_by_const(D0, (alpha_t * (math.exp(-h) - 1.0)), model_t)
-                matrix_elementwise_multiply_by_const(D1, 0.5 * (alpha_t * (math.exp(-h) - 1.0)), D1)
-                matrix_elementwise_minus(sample_t, model_t, x_t)
-                matrix_elementwise_minus(x_t, D1, x_t)
+                matrix_elementwise_multiply_by_const(sample, (sigma_t / sigma_s0), self.sample_t, stream=stream)
+                matrix_elementwise_multiply_by_const(D0, (alpha_t * (math.exp(-h) - 1.0)), self.model_t, stream=stream)
+                matrix_elementwise_multiply_by_const(self.D1, 0.5 * (alpha_t * (math.exp(-h) - 1.0)), self.D1, stream=stream)
+                matrix_elementwise_minus(self.sample_t, self.model_t, self.x_t, stream=stream)
+                matrix_elementwise_minus(self.x_t, self.D1, self.x_t, stream=stream)
             elif self.config.solver_type == "heun":
                 # x_t = (
                 #     (sigma_t / sigma_s0) * sample
                 #     - (alpha_t * (torch.exp(-h) - 1.0)) * D0
                 #     + (alpha_t * ((torch.exp(-h) - 1.0) / h + 1.0)) * D1
                 # )
-                matrix_elementwise_multiply_by_const(sample, (sigma_t / sigma_s0), sample_t)
-                matrix_elementwise_multiply_by_const(D0, (alpha_t * (math.exp(-h) - 1.0)), model_t)
-                matrix_elementwise_multiply_by_const(D1, 0.5 * (math.exp(-h) - 1.0) / h + 1.0, D1)
-                matrix_elementwise_minus(sample_t, model_t, x_t)
-                matrix_elementwise_add(x_t, D1, x_t)
+                matrix_elementwise_multiply_by_const(sample, (sigma_t / sigma_s0), self.sample_t, stream=stream)
+                matrix_elementwise_multiply_by_const(D0, (alpha_t * (math.exp(-h) - 1.0)), self.model_t, stream=stream)
+                matrix_elementwise_multiply_by_const(self.D1, 0.5 * (math.exp(-h) - 1.0) / h + 1.0, self.D1, stream=stream)
+                matrix_elementwise_minus(self.sample_t, self.model_t, self.x_t, stream=stream)
+                matrix_elementwise_add(self.x_t, self.D1, self.x_t, stream=stream)
         elif self.config.algorithm_type == "dpmsolver":
             # See https://arxiv.org/abs/2206.00927 for detailed derivations
             if self.config.solver_type == "midpoint":
@@ -392,30 +400,31 @@ class DPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
                 #     - (sigma_t * (torch.exp(h) - 1.0)) * D0
                 #     - 0.5 * (sigma_t * (torch.exp(h) - 1.0)) * D1
                 # )
-                matrix_elementwise_multiply_by_const(sample, (alpha_t / alpha_s0), sample_t)
-                matrix_elementwise_multiply_by_const(D0, (sigma_t * (math.exp(h) - 1.0)), model_t)
-                matrix_elementwise_multiply_by_const(D1, 0.5 * (sigma_t * (math.exp(h) - 1.0)), D1)
-                matrix_elementwise_minus(sample_t, model_t, x_t)
-                matrix_elementwise_minus(x_t, D1, x_t)
+                matrix_elementwise_multiply_by_const(sample, (alpha_t / alpha_s0), self.sample_t, stream=stream)
+                matrix_elementwise_multiply_by_const(D0, (sigma_t * (math.exp(h) - 1.0)), self.model_t, stream=stream)
+                matrix_elementwise_multiply_by_const(self.D1, 0.5 * (sigma_t * (math.exp(h) - 1.0)), self.D1, stream=stream)
+                matrix_elementwise_minus(self.sample_t, self.model_t, self.x_t, stream=stream)
+                matrix_elementwise_minus(self.x_t, self.D1, self.x_t, stream=stream)
             elif self.config.solver_type == "heun":
                 # x_t = (
                 #     (alpha_t / alpha_s0) * sample
                 #     - (sigma_t * (torch.exp(h) - 1.0)) * D0
                 #     - (sigma_t * ((torch.exp(h) - 1.0) / h - 1.0)) * D1
                 # )
-                matrix_elementwise_multiply_by_const(sample, (alpha_t / alpha_s0), sample_t)
-                matrix_elementwise_multiply_by_const(D0, (sigma_t * (math.exp(h) - 1.0)), model_t)
-                matrix_elementwise_multiply_by_const(D1, (sigma_t * ((torch.exp(h) - 1.0) / h - 1.0)), D1)
-                matrix_elementwise_minus(sample_t, model_t, x_t)
-                matrix_elementwise_minus(x_t, D1, x_t)
-        return x_t
+                matrix_elementwise_multiply_by_const(sample, (alpha_t / alpha_s0), self.sample_t, stream=stream)
+                matrix_elementwise_multiply_by_const(D0, (sigma_t * (math.exp(h) - 1.0)), self.model_t, stream=stream)
+                matrix_elementwise_multiply_by_const(self.D1, (sigma_t * ((torch.exp(h) - 1.0) / h - 1.0)), self.D1, stream=stream)
+                matrix_elementwise_minus(self.sample_t, self.model_t, self.x_t, stream=stream)
+                matrix_elementwise_minus(self.x_t, self.D1, self.x_t, stream=stream)
+        return self.x_t
 
     def multistep_dpm_solver_third_order_update(
         self,
-        model_output_list: List[torch.FloatTensor],
+        model_output_list,
         timestep_list: List[int],
         prev_timestep: int,
-        sample: torch.FloatTensor,
+        sample,
+        stream
     ) -> torch.FloatTensor:
         """
         One step for the third-order multistep DPM-Solver.
@@ -444,25 +453,18 @@ class DPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
         h, h_0, h_1 = lambda_t - lambda_s0, lambda_s0 - lambda_s1, lambda_s1 - lambda_s2
         r0, r1 = h_0 / h, h_1 / h
         D0 = m0
-        D1_0 = ht.empty(m0.shape, ctx=m0.ctx)
-        D1_1 = ht.empty(m0.shape, ctx=m0.ctx)
-        D1 = ht.empty(m0.shape, ctx=m0.ctx)
-        D2 = ht.empty(m0.shape, ctx=m0.ctx)
-        x_t = ht.empty(m0.shape, ctx=m0.ctx)
-        model_t = ht.empty(m0.shape, ctx=m0.ctx)
-        sample_t = ht.empty(m0.shape, ctx=m0.ctx)
         # D1_0, D1_1 = (1.0 / r0) * (m0 - m1), (1.0 / r1) * (m1 - m2)
-        matrix_elementwise_minus(m0, m1, D1_0)
-        matrix_elementwise_minus(m1, m2, D1_1)
-        matrix_elementwise_multiply_by_const(D1_0, 1.0 / r0, D1_0)
-        matrix_elementwise_multiply_by_const(D1_1, 1.0 / r1, D1_1)
+        matrix_elementwise_minus(m0, m1, self.D1_0, stream=stream)
+        matrix_elementwise_minus(m1, m2, self.D1_1, stream=stream)
+        matrix_elementwise_multiply_by_const(self.D1_0, 1.0 / r0, self.D1_0, stream=stream)
+        matrix_elementwise_multiply_by_const(self.D1_1, 1.0 / r1, self.D1_1, stream=stream)
         # D1 = D1_0 + (r0 / (r0 + r1)) * (D1_0 - D1_1)
         # D2 = (1.0 / (r0 + r1)) * (D1_0 - D1_1)
-        matrix_elementwise_minus(D1_0, D1_1, D1)
-        matrix_elementwise_minus(D1_0, D1_1, D2)
-        matrix_elementwise_multiply_by_const(D1, (r0 / (r0 + r1)), D1)
-        matrix_elementwise_minus(D1, D1_0, D1)
-        matrix_elementwise_multiply_by_const(D2, (1.0 / (r0 + r1)), D2)
+        matrix_elementwise_minus(self.D1_0, self.D1_1, self.D1, stream=stream)
+        matrix_elementwise_minus(self.D1_0, self.D1_1, self.D2, stream=stream)
+        matrix_elementwise_multiply_by_const(self.D1, (r0 / (r0 + r1)), self.D1, stream=stream)
+        matrix_elementwise_minus(self.D1, self.D1_0, self.D1, stream=stream)
+        matrix_elementwise_multiply_by_const(self.D2, (1.0 / (r0 + r1)), self.D2, stream=stream)
         if self.config.algorithm_type == "dpmsolver++":
             # See https://arxiv.org/abs/2206.00927 for detailed derivations
             # x_t = (
@@ -471,13 +473,13 @@ class DPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
             #     + (alpha_t * ((torch.exp(-h) - 1.0) / h + 1.0)) * D1
             #     - (alpha_t * ((torch.exp(-h) - 1.0 + h) / h**2 - 0.5)) * D2
             # )
-            matrix_elementwise_multiply_by_const(sample, (sigma_t / sigma_s0), sample_t)
-            matrix_elementwise_multiply_by_const(D0, (alpha_t * (math.exp(-h) - 1.0)), model_t)
-            matrix_elementwise_multiply_by_const(D1, 0.5 * (alpha_t * ((math.exp(-h) - 1.0) / h + 1.0)), D1)
-            matrix_elementwise_multiply_by_const(D2, (alpha_t * ((math.exp(-h) - 1.0 + h) / h**2 - 0.5)), D2)
-            matrix_elementwise_minus(sample_t, model_t, x_t)
-            matrix_elementwise_add(x_t, D1, x_t)
-            matrix_elementwise_minus(x_t, D2, x_t)
+            matrix_elementwise_multiply_by_const(sample, (sigma_t / sigma_s0), self.sample_t, stream=stream)
+            matrix_elementwise_multiply_by_const(D0, (alpha_t * (math.exp(-h) - 1.0)), self.model_t, stream=stream)
+            matrix_elementwise_multiply_by_const(self.D1, 0.5 * (alpha_t * ((math.exp(-h) - 1.0) / h + 1.0)), self.D1, stream=stream)
+            matrix_elementwise_multiply_by_const(self.D2, (alpha_t * ((math.exp(-h) - 1.0 + h) / h**2 - 0.5)), self.D2, stream=stream)
+            matrix_elementwise_minus(self.sample_t, self.model_t, self.x_t, stream=stream)
+            matrix_elementwise_add(self.x_t, self.D1, self.x_t, stream=stream)
+            matrix_elementwise_minus(self.x_t, self.D2, self.x_t, stream=stream)
         elif self.config.algorithm_type == "dpmsolver":
             # See https://arxiv.org/abs/2206.00927 for detailed derivations
             # x_t = (
@@ -486,14 +488,14 @@ class DPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
             #     - (sigma_t * ((torch.exp(h) - 1.0) / h - 1.0)) * D1
             #     - (sigma_t * ((torch.exp(h) - 1.0 - h) / h**2 - 0.5)) * D2
             # )
-            matrix_elementwise_multiply_by_const(sample, (alpha_t / alpha_s0), sample_t)
-            matrix_elementwise_multiply_by_const(D0, (sigma_t * (math.exp(h) - 1.0)), model_t)
-            matrix_elementwise_multiply_by_const(D1, (sigma_t * ((math.exp(h) - 1.0) / h - 1.0)), D1)
-            matrix_elementwise_multiply_by_const(D2, (sigma_t * ((math.exp(h) - 1.0 - h) / h**2 - 0.5)), D2)
-            matrix_elementwise_minus(sample_t, model_t, x_t)
-            matrix_elementwise_minus(x_t, D1, x_t)
-            matrix_elementwise_minus(x_t, D2, x_t)
-        return x_t
+            matrix_elementwise_multiply_by_const(sample, (alpha_t / alpha_s0), self.sample_t, stream=stream)
+            matrix_elementwise_multiply_by_const(D0, (sigma_t * (math.exp(h) - 1.0)), self.model_t, stream=stream)
+            matrix_elementwise_multiply_by_const(self.D1, (sigma_t * ((math.exp(h) - 1.0) / h - 1.0)), self.D1, stream=stream)
+            matrix_elementwise_multiply_by_const(self.D2, (sigma_t * ((math.exp(h) - 1.0 - h) / h**2 - 0.5)), self.D2, stream=stream)
+            matrix_elementwise_minus(self.sample_t, self.model_t, self.x_t, stream=stream)
+            matrix_elementwise_minus(self.x_t, self.D1, self.x_t, stream=stream)
+            matrix_elementwise_minus(self.x_t, self.D2, self.x_t, stream=stream)
+        return self.x_t
 
     def step(
         self,
@@ -522,13 +524,11 @@ class DPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
                 "Number of inference steps is 'None', you need to run 'set_timesteps' after creating the scheduler"
             )
 
-        if isinstance(timestep, torch.Tensor):
-            timestep = timestep.to(self.timesteps.device)
         step_index = (self.timesteps == timestep).nonzero()
         if len(step_index) == 0:
             step_index = len(self.timesteps) - 1
         else:
-            step_index = step_index.item()
+            step_index = step_index[0].item()
         prev_timestep = 0 if step_index == len(self.timesteps) - 1 else self.timesteps[step_index + 1]
         lower_order_final = (
             (step_index == len(self.timesteps) - 1) and self.config.lower_order_final and len(self.timesteps) < 15
@@ -537,22 +537,22 @@ class DPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
             (step_index == len(self.timesteps) - 2) and self.config.lower_order_final and len(self.timesteps) < 15
         )
 
-        model_output = self.convert_model_output(model_output, timestep, sample)
+        model_output = self.convert_model_output(model_output, timestep, sample, stream)
         for i in range(self.config.solver_order - 1):
             self.model_outputs[i] = self.model_outputs[i + 1]
         self.model_outputs[-1] = model_output
 
         if self.config.solver_order == 1 or self.lower_order_nums < 1 or lower_order_final:
-            prev_sample = self.dpm_solver_first_order_update(model_output, timestep, prev_timestep, sample)
+            prev_sample = self.dpm_solver_first_order_update(model_output, timestep, prev_timestep, sample, stream)
         elif self.config.solver_order == 2 or self.lower_order_nums < 2 or lower_order_second:
             timestep_list = [self.timesteps[step_index - 1], timestep]
             prev_sample = self.multistep_dpm_solver_second_order_update(
-                self.model_outputs, timestep_list, prev_timestep, sample
+                self.model_outputs, timestep_list, prev_timestep, sample, stream
             )
         else:
             timestep_list = [self.timesteps[step_index - 2], self.timesteps[step_index - 1], timestep]
             prev_sample = self.multistep_dpm_solver_third_order_update(
-                self.model_outputs, timestep_list, prev_timestep, sample
+                self.model_outputs, timestep_list, prev_timestep, sample, stream
             )
 
         if self.lower_order_nums < self.config.solver_order:
