@@ -282,7 +282,14 @@ class BasicTransformerBlock(nn.Module):
         name = f'BasicTransformerBlock_{BasicTransformerBlock.ID}_'
         weights = ht.Variable(name + 'norm1_weights', value=ht.array(self.norm1.weight, ctx=config.ctx))
         bias = ht.Variable(name + 'norm1_bias', value=ht.array(self.norm1.bias, ctx=config.ctx))
-        norm_hidden_states = ht.layer_normalization_op(hidden_states, weights, bias, eps=self.norm1.eps)
+
+        flag = config.fuse_ln_crossattn_linear_av if self.only_cross_attention else config.fuse_ln_selfattn_linear_av
+        if not flag:
+            norm_hidden_states = ht.layer_normalization_op(hidden_states, weights, bias, eps=self.norm1.eps)
+        # Fuse LayerNorm layer afterwards.
+        else:
+            norm_hidden_states = hidden_states
+            
         cross_attention_kwargs = cross_attention_kwargs if cross_attention_kwargs is not None else {}
 
         attn_output = self.attn1.build_hetu(
@@ -290,6 +297,9 @@ class BasicTransformerBlock(nn.Module):
             encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
             attention_mask=attention_mask,
             config=config,
+            ln_weights=weights,
+            ln_bias=bias,
+            ln_eps=self.norm1.eps,
             **cross_attention_kwargs,
         )
         hidden_states = ht.add_op(attn_output, hidden_states)
@@ -297,7 +307,12 @@ class BasicTransformerBlock(nn.Module):
         if self.attn2 is not None:
             weights = ht.Variable(name + 'norm2_weights', value=ht.array(self.norm2.weight, ctx=config.ctx))
             bias = ht.Variable(name + 'norm2_bias', value=ht.array(self.norm2.bias, ctx=config.ctx))
-            norm_hidden_states = ht.layer_normalization_op(hidden_states, weights, bias, eps=self.norm2.eps)
+            
+            if not config.fuse_ln_crossattn_linear_av:
+                norm_hidden_states = ht.layer_normalization_op(hidden_states, weights, bias, eps=self.norm2.eps)
+            # Fuse LayerNorm layer afterwards.
+            else:
+                norm_hidden_states = hidden_states
 
             # 2. Cross-Attention
             attn_output = self.attn2.build_hetu(
@@ -305,16 +320,29 @@ class BasicTransformerBlock(nn.Module):
                 encoder_hidden_states=encoder_hidden_states,
                 attention_mask=attention_mask,
                 config=config,
+                ln_weights=weights,
+                ln_bias=bias,
+                ln_eps=self.norm2.eps,
                 **cross_attention_kwargs,
             )
             hidden_states = ht.add_op(attn_output, hidden_states)
 
         weights = ht.Variable(name + 'norm3_weights', value=ht.array(self.norm3.weight, ctx=config.ctx))
         bias = ht.Variable(name + 'norm3_bias', value=ht.array(self.norm3.bias, ctx=config.ctx))
-        norm_hidden_states = ht.layer_normalization_op(hidden_states, weights, bias, eps=self.norm3.eps)
+        
+        if not config.fuse_ln_ff_linear_av:
+            norm_hidden_states = ht.layer_normalization_op(hidden_states, weights, bias, eps=self.norm3.eps)
+        # Fuse LayerNorm layer afterwards.
+        else:
+            norm_hidden_states = hidden_states
 
-        ff_output = self.ff.build_hetu(norm_hidden_states, config)
-
+        ff_output = self.ff.build_hetu(
+                norm_hidden_states, 
+                config, 
+                ln_weights=weights,
+                ln_bias=bias,
+                ln_eps=self.norm3.eps
+        )
         hidden_states = ht.add_op(ff_output, hidden_states)
 
         BasicTransformerBlock.ID += 1
@@ -427,9 +455,16 @@ class FeedForward(nn.Module):
         if final_dropout:
             self.net.append(nn.Dropout(dropout))
 
-    def build_hetu(self, hidden_states, config):
+    def build_hetu(self, hidden_states, config, 
+                ln_weights=None, ln_bias=None, ln_eps=0):
         name = f'FeedForward_{FeedForward.ID}_'
-        hidden_states = self.net[0].build_hetu(hidden_states, config)
+        hidden_states = self.net[0].build_hetu(
+            hidden_states, 
+            config, 
+            ln_weights=ln_weights, 
+            ln_bias=ln_bias, 
+            ln_eps=ln_eps
+        )
         weights = ht.Variable(name + 'linear_weights', value=ht.array(self.net[2].weight, ctx=config.ctx))
         bias = ht.Variable(name + 'linear_bias', value=ht.array(self.net[2].bias, ctx=config.ctx))
         hidden_states = ht.linear_op(hidden_states, weights, bias, trans_B=True)
@@ -485,16 +520,24 @@ class GEGLU(nn.Module):
         # mps: gelu is not implemented for float16
         return F.gelu(gate.to(dtype=torch.float32)).to(dtype=gate.dtype)
 
-    def build_hetu(self, hidden_states, config):
+    def build_hetu(self, hidden_states, config,
+                   ln_weights=None, ln_bias=None, ln_eps=0):
         name = f'GEGLU_{GEGLU.ID}_'
 
         weights = ht.Variable(name + 'proj_weights', value=ht.array(self.proj.weight, ctx=config.ctx))
         bias = ht.Variable(name + 'proj_bias', value=ht.array(self.proj.bias, ctx=config.ctx))
-        hidden_states = ht.linear_op(hidden_states, weights, bias, trans_B=True) # (batch, height * width, inner_dim)
         dim = self.proj.out_features // 2
-        gate = ht.slice_op(hidden_states, (0, 0, dim), (-1, -1, dim))
-        gate = ht.gelu_op(gate)
-        hidden_states = ht.slice_op(hidden_states, (0, 0, 0), (-1, -1, dim))
+        if (not config.fuse_ln_ff_linear_av) or (ln_weights == None):
+            hidden_states = ht.linear_op(hidden_states, weights, bias, trans_B=True) # (batch, height * width, inner_dim)
+            gate = ht.slice_op(hidden_states, (0, 0, dim), (-1, -1, dim))
+            gate = ht.gelu_op(gate)
+            hidden_states = ht.slice_op(hidden_states, (0, 0, 0), (-1, -1, dim))
+        # Fuse LayerNorm + Sparse Linear + GeLU Half together.
+        else:
+            hidden_states = ht.linear_op(hidden_states, weights, bias, trans_B=True, activation_mode=1,
+                                 ln_weight=ln_weights, ln_bias=ln_bias, eps=ln_eps)
+            gate = ht.slice_op(hidden_states, (0, 0, dim), (-1, -1, dim))
+            hidden_states = ht.slice_op(hidden_states, (0, 0, 0), (-1, -1, dim))
         hidden_states = ht.mul_op(hidden_states, gate)
 
         GEGLU.ID += 1
