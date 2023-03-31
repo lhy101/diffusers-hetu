@@ -225,23 +225,37 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         ctx = config.ctx
         residual = hidden_states
 
-        weights = ht.Variable(name + 'norm_weights', value=ht.array(self.norm.weight, ctx=ctx))
-        bias = ht.Variable(name + 'norm_bias', value=ht.array(self.norm.bias, ctx=ctx))
-        hidden_states = ht.group_normalization_op(hidden_states, weights, bias, self.norm.num_groups, eps=self.norm.eps)
-
         if self.use_linear_projection:
+            weights = ht.Variable(name + 'norm_weights', value=ht.array(self.norm.weight, ctx=ctx))
+            bias = ht.Variable(name + 'norm_bias', value=ht.array(self.norm.bias, ctx=ctx))
+            hidden_states = ht.group_normalization_op(hidden_states, weights, bias, self.norm.num_groups, eps=self.norm.eps)
             hidden_states = ht.transpose_op(hidden_states, (0, 2, 3, 1))
             hidden_states = ht.array_reshape_op(hidden_states, (config.batch, config.height * config.width, self.inner_dim))
             weights = ht.Variable(name + 'proj_in_w', value=ht.array(self.proj_in.weight, ctx=ctx))
             bias = ht.Variable(name + 'proj_in_b', value=ht.array(self.proj_in.bias, ctx=ctx))
             hidden_states = ht.linear_op(hidden_states, weights, bias, trans_B=True)
         else:
-            weights = ht.Variable(name + 'proj_in_w', value=ht.array(self.proj_in.weight, ctx=ctx))
-            bias = ht.Variable(name + 'proj_in_b', value=ht.array(self.proj_in.bias, ctx=ctx))
-            hidden_states = ht.conv2d_add_bias_op(hidden_states, weights, bias, stride=1, padding=0)
+            if not config.fuse_gn_av_conv:
+                weights = ht.Variable(name + 'norm_weights', value=ht.array(self.norm.weight, ctx=ctx))
+                bias = ht.Variable(name + 'norm_bias', value=ht.array(self.norm.bias, ctx=ctx))
+                hidden_states = ht.group_normalization_op(hidden_states, weights, bias, self.norm.num_groups, eps=self.norm.eps)
+                weights = ht.Variable(name + 'proj_in_w', value=ht.array(self.proj_in.weight, ctx=ctx))
+                bias = ht.Variable(name + 'proj_in_b', value=ht.array(self.proj_in.bias, ctx=ctx))
+                hidden_states = ht.conv2d_add_bias_op(hidden_states, weights, bias, stride=1, padding=0)
+            # Fuse GroupNorm + Sparse Conv together.
+            else:
+                gn_weights = ht.Variable(name + 'norm_weights', value=ht.array(self.norm.weight, ctx=ctx))
+                gn_bias = ht.Variable(name + 'norm_bias', value=ht.array(self.norm.bias, ctx=ctx))
+                conv_weights = ht.Variable(name + 'proj_in_w', value=ht.array(self.proj_in.weight, ctx=ctx))
+                conv_bias = ht.Variable(name + 'proj_in_b', value=ht.array(self.proj_in.bias, ctx=ctx))
+
+                hidden_states = ht.conv2d_add_bias_op(hidden_states, conv_weights, conv_bias, stride=1, padding=0,
+                                                activation_mode=0, gn_weight=gn_weights, gn_bias=gn_bias,
+                                                num_groups=self.norm.num_groups, eps=self.norm.eps)
+
             hidden_states = ht.transpose_op(hidden_states, (0, 2, 3, 1))
             hidden_states = ht.array_reshape_op(hidden_states, (config.batch, config.height * config.width, self.inner_dim))
-
+            
         for block in self.transformer_blocks:
             hidden_states = block.build_hetu(
                 hidden_states,

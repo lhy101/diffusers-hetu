@@ -181,13 +181,17 @@ class CrossAttention(nn.Module):
             **cross_attention_kwargs,
         )
 
-    def build_hetu(self, hidden_states, encoder_hidden_states=None, attention_mask=None, config=None, **cross_attention_kwargs):
+    def build_hetu(self, hidden_states, encoder_hidden_states=None, attention_mask=None, config=None, 
+                   ln_weights=None, ln_bias=None, ln_eps=0, **cross_attention_kwargs):
         return self.processor.build_hetu(
             self,
             hidden_states,
             encoder_hidden_states=encoder_hidden_states,
             attention_mask=attention_mask,
             config=config,
+            ln_weights=ln_weights, 
+            ln_bias=ln_bias,
+            ln_eps=ln_eps,
             **cross_attention_kwargs,
         )
 
@@ -318,25 +322,82 @@ class CrossAttnProcessor:
 
         return hidden_states
 
-    def build_hetu(self, attn: CrossAttention, hidden_states, encoder_hidden_states=None, attention_mask=None, config=None):
+    def build_hetu(self, attn: CrossAttention, hidden_states, encoder_hidden_states=None, attention_mask=None, 
+                   ln_weights=None, ln_bias=None, ln_eps=0, config=None):
         ctx = config.ctx
         name = 'cross_attn_' + str(CrossAttention.id) + '_'
 
-        weights = ht.Variable(name + 'to_q_weights', value=ht.array(attn.to_q.weight, ctx=ctx))
-        bias = ht.Variable(name + 'to_q_bias', value=ht.empty((attn.to_q.out_features, ), ctx=ctx))
-        query = ht.linear_op(hidden_states, weights, bias, trans_B=True)
+        weights_q = ht.Variable(name + 'to_q_weights', value=ht.array(attn.to_q.weight, ctx=ctx))
+        bias_q = ht.Variable(name + 'to_q_bias', value=ht.empty((attn.to_q.out_features, ), ctx=ctx))
+        weights_k = ht.Variable(name + 'to_k_weights', value=ht.array(attn.to_k.weight, ctx=ctx))
+        bias_k = ht.Variable(name + 'to_k_bias', value=ht.empty((attn.to_k.out_features, ), ctx=ctx))
+        weights_v = ht.Variable(name + 'to_v_weights', value=ht.array(attn.to_v.weight, ctx=ctx))
+        bias_v = ht.Variable(name + 'to_v_bias', value=ht.empty((attn.to_v.out_features, ), ctx=ctx))
 
         length_q = config.height * config.width
         length_kv = config.length if encoder_hidden_states is not None else length_q
         encoder_hidden_states = encoder_hidden_states if encoder_hidden_states is not None else hidden_states
 
-        weights = ht.Variable(name + 'to_k_weights', value=ht.array(attn.to_k.weight, ctx=ctx))
-        bias = ht.Variable(name + 'to_k_bias', value=ht.empty((attn.to_k.out_features, ), ctx=ctx))
-        key = ht.linear_op(encoder_hidden_states, weights, bias, trans_B=True)
-
-        weights = ht.Variable(name + 'to_v_weights', value=ht.array(attn.to_v.weight, ctx=ctx))
-        bias = ht.Variable(name + 'to_v_bias', value=ht.empty((attn.to_v.out_features, ), ctx=ctx))
-        value = ht.linear_op(encoder_hidden_states, weights, bias, trans_B=True)
+        # CrossAttn
+        if encoder_hidden_states != hidden_states:
+            # Whether to fuse LayerNorm + Sparse Linear together for query.
+            if (not config.fuse_ln_crossattn_linear_av) or (ln_weights == None):
+                # Whether to reuse the key and value of iter=0.
+                if not config.crossattn_reuse:
+                    query = ht.linear_op(hidden_states, weights_q, bias_q, trans_B=True)
+                    key = ht.linear_op(encoder_hidden_states, weights_k, bias_k, trans_B=True)
+                    value = ht.linear_op(encoder_hidden_states, weights_v, bias_v, trans_B=True)
+                else:
+                    query = ht.linear_op(hidden_states, weights_q, bias_q, trans_B=True)
+                    key = ht.linear_op(encoder_hidden_states, weights_k, bias_k, trans_B=True, name='CrossAttn_k')
+                    value = ht.linear_op(encoder_hidden_states, weights_v, bias_v, trans_B=True, name='CrossAttn_v')
+            else:
+                if not config.crossattn_reuse:
+                    query = ht.linear_op(hidden_states, weights_q, bias_q, trans_B=True,
+                                         ln_weight=ln_weights, ln_bias=ln_bias, eps=ln_eps)
+                    key = ht.linear_op(encoder_hidden_states, weights_k, bias_k, trans_B=True)
+                    value = ht.linear_op(encoder_hidden_states, weights_v, bias_v, trans_B=True)
+                else:
+                    query = ht.linear_op(hidden_states, weights_q, bias_q, trans_B=True,
+                                         ln_weight=ln_weights, ln_bias=ln_bias, eps=ln_eps)
+                    key = ht.linear_op(encoder_hidden_states, weights_k, bias_k, trans_B=True, name='CrossAttn_k')
+                    value = ht.linear_op(encoder_hidden_states, weights_v, bias_v, trans_B=True, name='CrossAttn_v')
+        # SelfAttn
+        else:
+            # Whether to fuse LayerNorm + Sparse Linear together for all query, key and value.
+            if (not config.fuse_ln_selfattn_linear_av) or (ln_weights == None):
+                # Whether to fuse qkv in one linear.
+                if not config.fuse_qkv_linear:
+                    query = ht.linear_op(hidden_states, weights_q, bias_q, trans_B=True)
+                    key = ht.linear_op(encoder_hidden_states, weights_k, bias_k, trans_B=True)
+                    value = ht.linear_op(encoder_hidden_states, weights_v, bias_v, trans_B=True)
+                else:
+                    weights_qkv = ht.Variable(name + 'to_qkv_weights', value=ht.array(
+                                    torch.cat((attn.to_q.weight, attn.to_k.weight, attn.to_v.weight), 0), ctx=ctx))
+                    bias_qkv = ht.Variable(name + 'to_qkv_bias', value=ht.empty(
+                                        (attn.to_q.out_features + attn.to_k.out_features + attn.to_v.out_features, ), ctx=ctx))
+                    qkv = ht.linear_op(hidden_states, weights_qkv, bias_qkv, trans_B=True)
+                    query = ht.slice_op(qkv, (0, 0, 0), (-1, -1, attn.to_q.out_features))
+                    key = ht.slice_op(qkv, (0, 0, attn.to_q.out_features), (-1, -1, attn.to_k.out_features))
+                    value = ht.slice_op(qkv, (0, 0, attn.to_q.out_features + attn.to_k.out_features), (-1, -1, attn.to_v.out_features))
+            else:
+                if not config.fuse_qkv_linear:
+                    query = ht.linear_op(hidden_states, weights_q, bias_q, trans_B=True,
+                                    ln_weight=ln_weights, ln_bias=ln_bias, eps=ln_eps)
+                    key = ht.linear_op(encoder_hidden_states, weights_k, bias_k, trans_B=True, 
+                                        ln_weight=ln_weights, ln_bias=ln_bias, eps=ln_eps)
+                    value = ht.linear_op(encoder_hidden_states, weights_v, bias_v, trans_B=True,
+                                        ln_weight=ln_weights, ln_bias=ln_bias, eps=ln_eps)
+                else:
+                    weights_qkv = ht.Variable(name + 'to_qkv_weights', value=ht.array(
+                                    torch.cat((attn.to_q.weight, attn.to_k.weight, attn.to_v.weight), 0), ctx=ctx))
+                    bias_qkv = ht.Variable(name + 'to_qkv_bias', value=ht.empty(
+                                        (attn.to_q.out_features + attn.to_k.out_features + attn.to_v.out_features, ), ctx=ctx))
+                    qkv = ht.linear_op(hidden_states, weights_qkv, bias_qkv, trans_B=True,
+                                        ln_weight=ln_weights, ln_bias=ln_bias, eps=ln_eps)
+                    query = ht.slice_op(qkv, (0, 0, 0), (-1, -1, attn.to_q.out_features))
+                    key = ht.slice_op(qkv, (0, 0, attn.to_q.out_features), (-1, -1, attn.to_k.out_features))
+                    value = ht.slice_op(qkv, (0, 0, attn.to_q.out_features + attn.to_k.out_features), (-1, -1, attn.to_v.out_features))
 
         if config.use_fused_multi_head_attention:
             hidden_states = ht.multi_head_attention_op(query, key, value, attn.heads)
