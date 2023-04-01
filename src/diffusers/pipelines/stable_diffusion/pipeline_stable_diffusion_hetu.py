@@ -93,7 +93,12 @@ class HetuUnetConfig(object):
         self.length = length
         self.ctx = ctx
         self.use_fused_multi_head_attention = use_fused_multi_head_attention
-
+        self.fuse_gn_av_conv = False
+        self.fuse_ln_selfattn_linear_av = False
+        self.fuse_ln_crossattn_linear_av = False
+        self.fuse_ln_ff_linear_av = False
+        self.fuse_qkv_linear = False
+        self.crossattn_reuse = False
 
 class StableDiffusionPipeline(DiffusionPipeline):
     r"""
