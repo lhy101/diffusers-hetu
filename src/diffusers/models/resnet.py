@@ -114,7 +114,7 @@ class Upsample2D(nn.Module):
             x = ht.interpolate_op(x, size=output_size, mode="nearest")
         weights = ht.Variable('upsampling_conv_w_' + str(Upsample2D.id), value=ht.array(self.conv.weight, ctx=config.ctx))
         bias = ht.Variable('upsampling_conv_b_' + str(Upsample2D.id), value=ht.array(self.conv.bias, ctx=config.ctx))
-        x = ht.conv2d_add_bias_op(x, weights, bias, padding=1)
+        x = ht.conv2d_add_bias_activate_op(x, weights, bias, padding=1, height=config.height, width=config.width)
         Upsample2D.id += 1
         return x
 
@@ -467,6 +467,8 @@ class ResnetBlock2D(nn.Module):
             self.conv_shortcut = torch.nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
 
     def build_hetu(self, input_tensor, temb, config=None):
+        if config.fuse_resnet:
+            return ht.resnet(input_tensor, temb, self, config, ctx=config.ctx)
         name = f'resnet_{str(ResnetBlock2D.id)}_'
         ctx = config.ctx
         hidden_states = input_tensor
@@ -487,9 +489,10 @@ class ResnetBlock2D(nn.Module):
         gn_bias = ht.Variable(name + 'norm1_bias', value=ht.array(self.norm1.bias, ctx=ctx))
         conv_weights = ht.Variable(name + 'conv1_w', value=ht.array(self.conv1.weight, ctx=ctx))
         conv_bias = ht.Variable(name + 'conv1_b', value=ht.array(self.conv1.bias, ctx=ctx))
-        hidden_states = ht.conv2d_add_bias_op(hidden_states, conv_weights, conv_bias, stride=1, padding=1,
+        hidden_states = ht.conv2d_add_bias_activate_op(hidden_states, conv_weights, conv_bias, stride=1, padding=1,
                                               activation_mode=1, gn_weight=gn_weights, gn_bias=gn_bias,
-                                              num_groups=self.norm1.num_groups, eps=self.norm1.eps)
+                                              num_groups=self.norm1.num_groups, eps=self.norm1.eps,
+                                              height=config.height, width=config.width)
 
         
         if temb is not None:
@@ -516,17 +519,18 @@ class ResnetBlock2D(nn.Module):
             weights = ht.Variable(name + 'conv2_w', value=ht.array(self.conv2.weight, ctx=ctx))
             bias = ht.Variable(name + 'conv2_b', value=ht.array(self.conv2.bias, ctx=ctx))
             hidden_states = ht.conv2d_add_bias_op(hidden_states, weights, bias, stride=1, padding=1)
-        
+
         # Fuse GroupNorm + SiLU + Sparse Conv together.
         else:
             gn_weights = ht.Variable(name + 'norm2_weights', value=ht.array(self.norm2.weight, ctx=ctx))
             gn_bias = ht.Variable(name + 'norm2_bias', value=ht.array(self.norm2.bias, ctx=ctx))
             conv_weights = ht.Variable(name + 'conv2_w', value=ht.array(self.conv2.weight, ctx=ctx))
             conv_bias = ht.Variable(name + 'conv2_b', value=ht.array(self.conv2.bias, ctx=ctx))
-            hidden_states = ht.conv2d_add_bias_op(hidden_states, conv_weights, conv_bias, stride=1, padding=1,
+            hidden_states = ht.conv2d_add_bias_activate_op(hidden_states, conv_weights, conv_bias, stride=1, padding=1,
                                                 activation_mode=1, gn_weight=gn_weights, gn_bias=gn_bias,
-                                                num_groups=self.norm2.num_groups, eps=self.norm2.eps)
-        
+                                                num_groups=self.norm2.num_groups, eps=self.norm2.eps,
+                                                height=config.height, width=config.width)
+
         if self.conv_shortcut is not None:
             weights = ht.Variable(name + 'conv_shortcut_weights', value=ht.array(self.conv_shortcut.weight, ctx=ctx))
             bias = ht.Variable(name + 'conv_shortcut_bias', value=ht.array(self.conv_shortcut.bias, ctx=ctx))
