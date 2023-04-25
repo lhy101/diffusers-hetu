@@ -102,7 +102,9 @@ class HetuUnetConfig(object):
         self.ctx = ctx
         self.use_fused_multi_head_attention = use_fused_multi_head_attention
 
-        self.latent_scale = 24 * 24
+        self.latent_scale_linear = 24 * 24
+        self.latent_scale_conv = 24 * 24
+        self.latent_scale_attn = 48 * 48
 
         self.fuse_gn_av_conv = True
 
@@ -110,6 +112,10 @@ class HetuUnetConfig(object):
         self.fuse_resnet = False
 
         # Fuse together, so we need to turn on or turn off all three settings.
+        self.merge_rate = 0.9
+        self.fuse_attn1_attn2_ff = False
+
+        # If we turn on fuse_attn1_attn2_ff, we need to turn on all three settings.
         self.fuse_self_attn = True
         self.fuse_cross_attn = True
         self.fuse_ln_ff_linear_av = True
