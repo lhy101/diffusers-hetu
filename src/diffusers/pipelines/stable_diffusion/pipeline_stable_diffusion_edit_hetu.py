@@ -102,11 +102,13 @@ class HetuUnetConfig(object):
         self.ctx = ctx
         self.use_fused_multi_head_attention = use_fused_multi_head_attention
 
-        self.profile = False
+        # Use to profile sparse op calculation time.
+        self.profile = True
+        self.turn_off_h2d = True
 
-        self.latent_scale_linear = 24 * 24
-        self.latent_scale_conv = 24 * 24
-        self.latent_scale_attn = 48 * 48
+        self.latent_scale_linear = 0
+        self.latent_scale_conv = 0
+        self.latent_scale_attn = 0
 
         self.fuse_gn_av_conv = True
 
