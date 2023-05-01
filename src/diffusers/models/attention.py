@@ -548,7 +548,7 @@ class GEGLU(nn.Module):
             hidden_states = ht.slice_op(hidden_states, (0, 0, 0), (-1, -1, dim))
         # Fuse LayerNorm + Sparse Linear + GeLU Half together.
         else:
-            hidden_states = ht.linear_op(hidden_states, weights, bias, trans_B=True, activation_mode=1,
+            hidden_states = ht.linear_op(hidden_states, weights, bias, trans_B=True, name='GEGLU', activation_mode=1,
                                  ln_weight=ln_weights, ln_bias=ln_bias, eps=ln_eps, config=config)
             gate = ht.slice_op(hidden_states, (0, 0, dim), (-1, -1, dim))
             hidden_states = ht.slice_op(hidden_states, (0, 0, 0), (-1, -1, dim))

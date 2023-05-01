@@ -30,7 +30,8 @@ def diffusers(args):
                 merge_rate = args.merge_rate,
                 fuse_attn1_attn2_ff = args.fuse_attn1_attn2_ff,
                 fuse_self_attn = args.fuse_self_attn,
-                fuse_cross_attn = args.fuse_cross_attn
+                fuse_cross_attn = args.fuse_cross_attn,
+                radical = args.radical
                 )
 
     if args.run_sample:
