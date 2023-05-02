@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import time
+from pynvml import *
 import shutil
 import inspect
 from typing import Any, Callable, Dict, List, Optional, Union
@@ -759,6 +760,13 @@ class StableDiffusionPipelineEdit(DiffusionPipeline):
             noise_pred_text = ht.empty((batch_size, ) + latents.shape[1: ], ctx=ctx)
         self.scheduler.build_hetu(latents.shape, ctx)
 
+        '''
+        nvmlInit()
+        h = nvmlDeviceGetHandleByIndex(5)
+        info = nvmlDeviceGetMemoryInfo(h)
+        print(f'Before compile, memory use is: {info.used}')
+        '''
+
         # 6.2 compile hetu unet
         if save_checkpoint:
             if os.path.exists('runtime'):
@@ -769,9 +777,24 @@ class StableDiffusionPipelineEdit(DiffusionPipeline):
                         latents.shape[2], latents.shape[3], prompt_embeds, config)
         stream = executor.config.comp_stream
 
+        '''
+        nvmlInit()
+        h = nvmlDeviceGetHandleByIndex(5)
+        info = nvmlDeviceGetMemoryInfo(h)
+        print(f'After compile, memory use is: {info.used}')
+        '''
+
         # 7. Denoising loop
         self.mask_list = []
         executor.init_round(save_checkpoint, mask)
+
+        '''
+        nvmlInit()
+        h = nvmlDeviceGetHandleByIndex(5)
+        info = nvmlDeviceGetMemoryInfo(h)
+        print(f'After init, memory use is: {info.used}')
+        '''
+
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
