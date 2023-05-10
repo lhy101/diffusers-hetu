@@ -85,7 +85,8 @@ class HetuUnetConfig(object):
                  fuse_qkv_linear = False,
                  radical = True,
                  linear_reuse = False,
-                 fuse_resnet = False
+                 fuse_resnet = False,
+                 strong_gpu = False
                  ):
         """Constructs BertConfig.
 
@@ -149,6 +150,9 @@ class HetuUnetConfig(object):
         # Have some unknown bugs, and no significant speed-up.
         self.linear_reuse = linear_reuse
         self.fuse_resnet = fuse_resnet
+
+        # A100
+        self.strong_gpu = strong_gpu
         
 
 
@@ -769,9 +773,7 @@ class StableDiffusionPipelineEdit(DiffusionPipeline):
 
         # 6.2 compile hetu unet
         if save_checkpoint:
-            if os.path.exists('runtime'):
-                shutil.rmtree('runtime')
-            os.makedirs('runtime')
+            os.makedirs('runtime', exist_ok=True)
             os.makedirs('checkpoints', exist_ok=True)
         executor = self.build_hetu(batch_size * 2 if do_classifier_free_guidance else batch_size,
                         latents.shape[2], latents.shape[3], prompt_embeds, config)
@@ -798,6 +800,13 @@ class StableDiffusionPipelineEdit(DiffusionPipeline):
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
+
+                if i == 0 or i == 30:
+                    latents_sample = torch.Tensor(latents.asnumpy()).to(self.ctx)
+                    image = self.decode_latents(latents_sample)
+                    image = self.numpy_to_pil(image)
+                    image[0].save(f'{i}_{0 if save_checkpoint else 1}.png')
+
                 # expand the latents if we are doing classifier free guidance
                 if do_classifier_free_guidance:
                     concatenate([latents, latents], out_arr=latent_model_input, axis=0, stream=stream)

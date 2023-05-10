@@ -11,7 +11,7 @@ def diffusers(args):
     device = f'cuda:{args.cuda}'
     access_token = "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"
     if args.download:
-        pipe = StableDiffusionPipelineEdit.from_pretrained("stabilityai/stable-diffusion-2-1", use_auth_token=access_token)
+        pipe = StableDiffusionPipelineEdit.from_pretrained("stabilityai/stable-diffusion-2-1", use_auth_token=access_token, force_download=True)
     else:
         # may change the root
         pipe = StableDiffusionPipelineEdit.from_pretrained("/root/.cache/huggingface/diffusers/models--stabilityai--stable-diffusion-2-1/snapshots/36a01dc742066de2e8c91e7cf0b8f6b53ef53da1", use_auth_token=access_token)
@@ -31,7 +31,8 @@ def diffusers(args):
                 fuse_attn1_attn2_ff = args.fuse_attn1_attn2_ff,
                 fuse_self_attn = args.fuse_self_attn,
                 fuse_cross_attn = args.fuse_cross_attn,
-                radical = args.radical
+                radical = args.radical,
+                strong_gpu = args.strong_gpu
                 )
 
     if args.run_sample:
@@ -53,14 +54,14 @@ def diffusers(args):
 
         latents = torch.randn((1, 4, args.height, args.width), dtype=torch.float32)
         # torch.save(latents, "seed.pt")
-        # latents = torch.load("seed.pt", map_location=device)
+        latents = torch.load("seed.pt", map_location=device)
         images = pipe(prompt, num_inference_steps=50, latents=latents, save_checkpoint=True, config=config).images
 
         for i in range(len(images)):
             images[i].save(f"image_origin.png")
         
-        # mask = torch.load(f'mask_temp.pt')
-        images = pipe(prompt_edited, num_inference_steps=50, latents=latents, save_checkpoint=False).images
+        mask = torch.load(f'mask_30.pt')
+        images = pipe(prompt_edited, num_inference_steps=50, latents=latents, save_checkpoint=False, mask=mask).images
 
         for i in range(len(images)):
             images[i].save(f"image_edited.png")
@@ -69,7 +70,7 @@ def diffusers(args):
     if args.run_dataset:
 
         texts = []
-        with open('gpt-generated-prompts.jsonl', 'rb') as f: 
+        with open('data/gpt-generated-prompts.jsonl', 'rb') as f: 
             for item in json_lines.reader(f):
                 texts.append([item['input'], item['output']])
         print('dataset size:', len(texts))
@@ -78,16 +79,16 @@ def diffusers(args):
 
             text_pair = texts[cnt]
 
-            latents = torch.load(f'random_seed/{cnt}.pt', map_location=device)
+            latents = torch.load(f'data/random_seed/{cnt}.pt', map_location=device)
 
-            images = pipe(text_pair[0], num_inference_steps=50, latents=latents, save_checkpoint=True).images
+            images = pipe(text_pair[0], num_inference_steps=50, latents=latents, save_checkpoint=True, config=config).images
             images[0].save(f"dataset/hetu_origin/{cnt}.png")
-            mask = torch.load(f'mask/mask_pt/mask_{cnt}.pt')
+            mask = torch.load(f'mask_0_75/mask_pt/mask_{cnt}.pt')
             if mask.sum() == 0:
-                images[0].save(f"dataset/hetu_edit_conv/{cnt}.png")
+                images[0].save(f"dataset/hetu_edit_new/{cnt}.png")
                 continue
             images = pipe(text_pair[1], num_inference_steps=50, latents=latents, save_checkpoint=False, mask=mask).images
-            images[0].save(f"dataset/hetu_edit_conv/{cnt}.png")
+            images[0].save(f"dataset/hetu_edit_new/{cnt}.png")
     
 
 
@@ -109,21 +110,23 @@ if __name__ == '__main__':
     # Use to profile sparse op calculation time. The data will store in profile_[conv/linear/attention].pkl file.
     parser.add_argument('--profile', type=int, default=0, help='profile the performance')
 
-    parser.add_argument('--latent_scale_linear', type=int, default=0, help='limit of the latent scale to do sparse linear')
-    parser.add_argument('--latent_scale_conv', type=int, default=0, help='limit of the latent scale to do sparse conv')
-    parser.add_argument('--latent_scale_attn', type=int, default=0, help='limit of the latent scale to do sparse attention')
+    parser.add_argument('--latent_scale_linear', type=int, default=24*24, help='limit of the latent scale to do sparse linear')
+    parser.add_argument('--latent_scale_conv', type=int, default=24*24, help='limit of the latent scale to do sparse conv')
+    parser.add_argument('--latent_scale_attn', type=int, default=48*48, help='limit of the latent scale to do sparse attention')
 
     parser.add_argument('--fuse_gn_av_conv', type=int, default=1, help='fuse_gn_av_conv')
 
     # If we want to use merge_rate, we need to set fuse_attn1_attn2_ff to False.
     parser.add_argument('--merge_rate', type=float, default=0.9, help='merge_rate to edit the images')
-    parser.add_argument('--fuse_attn1_attn2_ff', type=int, default=0, help='fuse_attn1_attn2_ff')
+    parser.add_argument('--fuse_attn1_attn2_ff', type=int, default=1, help='fuse_attn1_attn2_ff')
 
     parser.add_argument('--fuse_self_attn', type=int, default=1, help='fuse_self_attn')
     parser.add_argument('--fuse_cross_attn', type=int, default=1, help='fuse_cross_attn')
     parser.add_argument('--fuse_ln_ff_linear_av_add', type=int, default=1, help='fuse_ln_ff_linear_av_add')
 
     parser.add_argument('--radical', type=int, default=1, help='use sparse k and v in self attention')
+
+    parser.add_argument('--strong_gpu', type=int, default=0, help='put all output buffer in gpu')
 
     args = parser.parse_args()
     diffusers(args)
