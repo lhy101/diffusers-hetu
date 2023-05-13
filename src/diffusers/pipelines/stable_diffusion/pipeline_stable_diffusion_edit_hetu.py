@@ -83,7 +83,8 @@ class HetuUnetConfig(object):
                  fuse_ln_selfattn_linear_av = False,
                  fuse_ln_crossattn_linear_av = False,
                  fuse_qkv_linear = False,
-                 radical = True,
+                 radical_attn = True,
+                 radical_conv = True,
                  linear_reuse = False,
                  fuse_resnet = False,
                  strong_gpu = False
@@ -145,7 +146,10 @@ class HetuUnetConfig(object):
         self.fuse_qkv_linear = fuse_qkv_linear
 
         # Use sparse k and v in self attention.
-        self.radical = radical
+        self.radical_attn = radical_attn
+
+        # Only synchronize on a few conv layers.
+        self.radical_conv = radical_conv
 
         # Have some unknown bugs, and no significant speed-up.
         self.linear_reuse = linear_reuse
@@ -626,6 +630,7 @@ class StableDiffusionPipelineEdit(DiffusionPipeline):
         callback_steps: Optional[int] = 1,
         save_checkpoint: bool = True,
         mask: Optional[torch.FloatTensor] = None,
+        continuous_edit: bool = False,
         config: Optional[HetuUnetConfig] = None,
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
     ):
@@ -788,7 +793,7 @@ class StableDiffusionPipelineEdit(DiffusionPipeline):
 
         # 7. Denoising loop
         self.mask_list = []
-        executor.init_round(save_checkpoint, mask)
+        executor.init_round(save_checkpoint, mask, continuous_edit)
 
         '''
         nvmlInit()
@@ -839,9 +844,9 @@ class StableDiffusionPipelineEdit(DiffusionPipeline):
                     if callback is not None and i % callback_steps == 0:
                         callback(i, t, latents)
 
-                if save_checkpoint:
+                if mask is None and save_checkpoint:
                     np.save(f'checkpoints/{i+1}.npy', latents.asnumpy())
-                elif mask is None and i <= 9:
+                if mask is None and i <= 9:
                     latents_origin = np.load(f'checkpoints/{i+1}.npy')
                     diff = calculate_diff(latents.asnumpy()[0], latents_origin[0])
                     self.mask_list.append(diff)
@@ -866,7 +871,7 @@ class StableDiffusionPipelineEdit(DiffusionPipeline):
 
                         torch.save(torch.from_numpy(mask), 'runtime/mask.pt')
                         mask_rate = mask.sum() / mask.size
-                        print("mask rate:", mask_rate)
+                        # print("mask rate:", mask_rate)
 
                         im = Image.fromarray((mask * 255).astype(np.uint8))
                         im = im.convert('L')  
