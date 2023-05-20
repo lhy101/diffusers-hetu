@@ -1,10 +1,17 @@
 import torch
+import numpy as np
 from diffusers import HetuUnetConfig, StableDiffusionPipelineEdit, DPMSolverMultistepScheduler
 from tqdm import tqdm
 import json_lines # pip install json-lines
 import argparse
-import os
-import random
+from PIL import Image
+
+def load_mask(path):
+    im = Image.open(path)
+    mask = im.convert('L').resize((96, 96))
+    mask = torch.from_numpy(np.array(mask))
+    return mask
+
 
 def diffusers(args):
 
@@ -31,40 +38,73 @@ def diffusers(args):
                 fuse_attn1_attn2_ff = args.fuse_attn1_attn2_ff,
                 fuse_self_attn = args.fuse_self_attn,
                 fuse_cross_attn = args.fuse_cross_attn,
-                radical = args.radical,
+                radical_attn = args.radical_attn,
+                radical_conv = args.radical_conv,
                 strong_gpu = args.strong_gpu
                 )
 
-    if args.run_sample:
+    if args.run_single_sample:
     
-        '''
         prompt = [
             "Mountaineering Wallpapers.",
         ]
         prompt_edited = [
             "Mountaineering Wallpapers under fireworks.",
         ]
-        '''
-        prompt = [
-            "A dog sitting on the sofa.",
-        ]
-        prompt_edited = [
-            "A dog sitting on the sofa with a hat on its head.",
-        ]
 
         latents = torch.randn((1, 4, args.height, args.width), dtype=torch.float32)
         # torch.save(latents, "seed.pt")
-        latents = torch.load("seed.pt", map_location=device)
+        # latents = torch.load("seed.pt", map_location=device)
         images = pipe(prompt, num_inference_steps=50, latents=latents, save_checkpoint=True, config=config).images
 
         for i in range(len(images)):
             images[i].save(f"image_origin.png")
         
-        mask = torch.load(f'mask_30.pt')
+        mask = torch.load(f'mask.pt')
         images = pipe(prompt_edited, num_inference_steps=50, latents=latents, save_checkpoint=False, mask=mask).images
 
         for i in range(len(images)):
             images[i].save(f"image_edited.png")
+    
+    if args.run_continous_sample:
+    
+        prompt1 = [
+            "A cloudy sky.",
+        ]
+        prompt2 = [
+            "A river under the cloudy sky.",
+        ]
+        prompt3 = [
+            "A mountain under the cloudy sky.",
+        ]
+        prompt4 = [
+            "A snow mountain under the cloudy sky.",
+        ]
+        prompt5 = [
+            "A snow mountain under the cloudy sky with fireworks.",
+        ]
+
+        latents = torch.randn((1, 4, args.height, args.width), dtype=torch.float32)
+        # torch.save(latents, "seed.pt")
+        # latents = torch.load("seed.pt", map_location=device)
+        image = pipe(prompt1, num_inference_steps=50, latents=latents, save_checkpoint=True, config=config).images[0]
+        image.save(f"image1.png")
+        
+        mask = load_mask("mask1.png")
+        image = pipe(prompt2, num_inference_steps=50, latents=latents, save_checkpoint=True, mask=mask, continuous_edit=True).images[0]
+        image.save(f"image2.png")
+
+        mask = load_mask("mask2.png")
+        image = pipe(prompt3, num_inference_steps=50, latents=latents, save_checkpoint=True, mask=mask, continuous_edit=True).images[0]
+        image.save(f"image3.png")
+
+        mask = load_mask("mask3.png")
+        image = pipe(prompt4, num_inference_steps=50, latents=latents, save_checkpoint=True, mask=mask, continuous_edit=True).images[0]
+        image.save(f"image4.png")
+
+        mask = load_mask("mask4.png")
+        image = pipe(prompt5, num_inference_steps=50, latents=latents, save_checkpoint=True, mask=mask, continuous_edit=True).images[0]
+        image.save(f"image5.png")
     
 
     if args.run_dataset:
@@ -83,22 +123,23 @@ def diffusers(args):
 
             images = pipe(text_pair[0], num_inference_steps=50, latents=latents, save_checkpoint=True, config=config).images
             images[0].save(f"dataset/hetu_origin/{cnt}.png")
-            mask = torch.load(f'mask_0_75/mask_pt/mask_{cnt}.pt')
+            mask = torch.load(f'mask/mask_pt/mask_{cnt}.pt')
             if mask.sum() == 0:
-                images[0].save(f"dataset/hetu_edit_new/{cnt}.png")
+                images[0].save(f"dataset/hetu_edit/{cnt}.png")
                 continue
             images = pipe(text_pair[1], num_inference_steps=50, latents=latents, save_checkpoint=False, mask=mask).images
-            images[0].save(f"dataset/hetu_edit_new/{cnt}.png")
+            images[0].save(f"dataset/hetu_edit/{cnt}.png")
     
 
 
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--cuda', type=int, default=5, help='cuda number')
+    parser.add_argument('--cuda', type=int, default=0, help='cuda number')
     parser.add_argument('--download', type=int, default=0, help='need to download the model from huggingface')
 
-    parser.add_argument('--run_sample', type=int, default=1, help='run a sample (for performance test)')
+    parser.add_argument('--run_single_sample', type=int, default=1, help='run a single sample (for performance test)')
+    parser.add_argument('--run_continous_sample', type=int, default=0, help='run a continous sample')
     parser.add_argument('--run_dataset', type=int, default=0, help='run the dataset (for efficiency test)')
     parser.add_argument('--base_num', type=int, default=0, help='base image number of the dataset')
     parser.add_argument('--limit_num', type=int, default=3000, help='limit image number of the dataset')
@@ -124,7 +165,9 @@ if __name__ == '__main__':
     parser.add_argument('--fuse_cross_attn', type=int, default=1, help='fuse_cross_attn')
     parser.add_argument('--fuse_ln_ff_linear_av_add', type=int, default=1, help='fuse_ln_ff_linear_av_add')
 
-    parser.add_argument('--radical', type=int, default=1, help='use sparse k and v in self attention')
+    # Turn on these settings for higher performance (but may lead to lower image quality).
+    parser.add_argument('--radical_attn', type=int, default=0, help='use sparse k and v in self attention')
+    parser.add_argument('--radical_conv', type=int, default=0, help='only synchronize on a few conv layers')
 
     parser.add_argument('--strong_gpu', type=int, default=0, help='put all output buffer in gpu')
 
